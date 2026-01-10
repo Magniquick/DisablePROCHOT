@@ -12,7 +12,7 @@ ld -T /usr/lib/elf_x86_64_efi.lds -Bsymbolic -shared -nostdlib -znocombreloc \
     -o DisablePROCHOT.so DisablePROCHOT.o \
     $(gcc -print-libgcc-file-name) /usr/lib/libgnuefi.a
 
-objcopy -j .text -j .sdata -j .data -j .dynamic -j .dynsym -j .rel \
+objcopy -j .text -j .sdata -j .rodata -j .data -j .dynamic -j .dynsym -j .rel \
         -j .rela -j .reloc -S --target=efi-app-x86_64 DisablePROCHOT.so DisablePROCHOT.efi
 
 ls -l DisablePROCHOT.efi
