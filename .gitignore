@@ -1,3 +1,4 @@
 *.so 
 *.o
 *.efi
+test/esp.img

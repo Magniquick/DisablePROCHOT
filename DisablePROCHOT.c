@@ -7,31 +7,25 @@
 #include <efilib.h>
 
 // Write a 64-bit value to a Model-Specific Register (MSR).
+// wrmsr takes: ECX=index, EDX:EAX=value (high:low 32-bit halves).
 static uint64_t AsmWriteMsr64(uint32_t index, uint64_t val) {
-  uint32_t low;
-  uint32_t high;
-
-  low = (uint32_t)(val);
-  high = (uint32_t)(val >> 32);
-
+  uint32_t low = (uint32_t)(val);
+  uint32_t high = (uint32_t)(val >> 32);
   __asm__ __volatile__("wrmsr" : : "c"(index), "a"(low), "d"(high));
-
   return val;
 }
 
 // Check CPUID leaf 1 ECX bit 31 to detect if running under a hypervisor.
+// Bit 31 is set by VMMs to indicate guest mode (Intel/AMD spec).
 static int IsHypervisorPresent(void) {
   uint32_t eax_out, ebx_out, ecx, edx_out;
-
-  /* CPUID leaf 1, ECX bit 31 indicates hypervisor presence */
   __asm__ __volatile__("cpuid"
                        : "=a"(eax_out), "=b"(ebx_out), "=c"(ecx), "=d"(edx_out)
                        : "0"(1));
-
   (void)eax_out;
   (void)ebx_out;
   (void)edx_out;
-  return (ecx >> 31) & 1;
+  return (ecx >> 31) & 1;  // Extract bit 31
 }
 
 // Partial EFI_LOAD_OPTION structure for parsing boot variables.
@@ -51,36 +45,40 @@ static CHAR16 HexDigit(UINTN val) {
 // Print an EFI_STATUS value as hex to the console for debugging.
 static void PrintStatus(SIMPLE_TEXT_OUTPUT_INTERFACE *conOut,
                         EFI_STATUS status) {
-  CHAR16 buf[3 + (sizeof(EFI_STATUS) * 2) + 2];
-  UINTN i;
-  buf[0] = L' ';
-  buf[1] = L'0';
-  buf[2] = L'x';
-  for (i = 0; i < sizeof(EFI_STATUS) * 2; ++i) {
-    UINTN shift = (sizeof(EFI_STATUS) * 8 - 4) - (i * 4);
-    UINTN nibble = (status >> shift) & 0xF;
-    buf[3 + i] = HexDigit(nibble);
+  // " 0x" (3) + hex digits (sizeof*2) + "\r\n\0" (3)
+  CHAR16 buf[3 + (sizeof(EFI_STATUS) * 2) + 3];
+  UINTN pos = 0;
+
+  buf[pos++] = L' ';
+  buf[pos++] = L'0';
+  buf[pos++] = L'x';
+  // Extract each nibble (4 bits) from most-significant to least-significant.
+  // For 64-bit status: i=0 gives shift=60 (top nibble), i=15 gives shift=0.
+  for (UINTN i = 0; i < sizeof(EFI_STATUS) * 2; ++i) {
+    UINTN shift = (sizeof(EFI_STATUS) * 2 - 1 - i) * 4;
+    buf[pos++] = HexDigit((status >> shift) & 0xF);
   }
-  buf[3 + i] = L'\r';
-  buf[4 + i] = L'\n';
-  buf[5 + i] = L'\0';
+  buf[pos++] = L'\r';
+  buf[pos++] = L'\n';
+  buf[pos] = L'\0';
+
   conOut->OutputString(conOut, buf);
 }
 
 // Build a "Boot####" variable name from a boot option ID.
+// bootId is a 16-bit value; extract 4 hex digits (4 bits each).
 static void MakeBootVarName(UINT16 bootId, CHAR16 *name, UINTN nameLen) {
   if (nameLen < 9) {
     return;
   }
-
   name[0] = L'B';
   name[1] = L'o';
   name[2] = L'o';
   name[3] = L't';
-  name[4] = HexDigit((bootId >> 12) & 0xF);
-  name[5] = HexDigit((bootId >> 8) & 0xF);
-  name[6] = HexDigit((bootId >> 4) & 0xF);
-  name[7] = HexDigit(bootId & 0xF);
+  name[4] = HexDigit((bootId >> 12) & 0xF);  // Bits 15-12
+  name[5] = HexDigit((bootId >> 8) & 0xF);   // Bits 11-8
+  name[6] = HexDigit((bootId >> 4) & 0xF);   // Bits 7-4
+  name[7] = HexDigit(bootId & 0xF);          // Bits 3-0
   name[8] = L'\0';
 }
 
@@ -371,6 +369,8 @@ static EFI_STATUS efi_main_sysv(EFI_HANDLE image,
                          L"Hypervisor detected, skipping MSR write\r\n");
   } else {
     conOut->OutputString(conOut, L"Disabling BD PROCHOT\r\n");
+    // MSR 0x1FC = IA32_POWER_CTL. Writing 0 clears bit 0 (BD PROCHOT enable),
+    // disabling bi-directional processor hot throttling.
     AsmWriteMsr64(0x1FC, 0);
     conOut->OutputString(conOut, L"BD PROCHOT disabled\r\n");
   }

@@ -5,6 +5,7 @@ gcc -I/usr/include/efi -I/usr/include/efi/x86_64 \
     -fPIC -fshort-wchar -ffreestanding -fno-stack-protector -maccumulate-outgoing-args \
     -Wall -Werror \
     -m64 -mno-red-zone \
+	-O3 \
     -c -o DisablePROCHOT.o DisablePROCHOT.c
 
 ld -T /usr/lib/elf_x86_64_efi.lds -Bsymbolic -shared -nostdlib -znocombreloc \
@@ -28,6 +29,7 @@ gcc -I/usr/include/efi -I/usr/include/efi/x86_64 \
     -fPIC -fshort-wchar -ffreestanding -fno-stack-protector -maccumulate-outgoing-args \
     -Wall -Werror \
     -m64 -mno-red-zone \
+	-O3 \
     -c -o ChainSuccess.o ChainSuccess.c
 
 ld -T /usr/lib/elf_x86_64_efi.lds -Bsymbolic -shared -nostdlib -znocombreloc \
