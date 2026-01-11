@@ -1,8 +1,12 @@
 // Copyright (c) 2018 Park Ju Hyung
+//
+// EFI application to disable BD PROCHOT (bi-directional processor hot)
+// throttling, then chainload to the next boot entry or fallback EFI app.
 
 #include <efi.h>
 #include <efilib.h>
 
+// Write a 64-bit value to a Model-Specific Register (MSR).
 static uint64_t AsmWriteMsr64(uint32_t index, uint64_t val) {
   uint32_t low;
   uint32_t high;
@@ -15,6 +19,7 @@ static uint64_t AsmWriteMsr64(uint32_t index, uint64_t val) {
   return val;
 }
 
+// Check CPUID leaf 1 ECX bit 31 to detect if running under a hypervisor.
 static int IsHypervisorPresent(void) {
   uint32_t eax_out, ebx_out, ecx, edx_out;
 
@@ -29,11 +34,13 @@ static int IsHypervisorPresent(void) {
   return (ecx >> 31) & 1;
 }
 
+// Partial EFI_LOAD_OPTION structure for parsing boot variables.
 typedef struct __attribute__((packed)) {
   UINT32 Attributes;
   UINT16 FilePathListLength;
 } EFI_LOAD_OPTION_HEADER;
 
+// Convert a nibble (0-15) to its hex character representation.
 static CHAR16 HexDigit(UINTN val) {
   if (val < 10) {
     return (CHAR16)(L'0' + val);
@@ -41,6 +48,7 @@ static CHAR16 HexDigit(UINTN val) {
   return (CHAR16)(L'A' + (val - 10));
 }
 
+// Print an EFI_STATUS value as hex to the console for debugging.
 static void PrintStatus(SIMPLE_TEXT_OUTPUT_INTERFACE *conOut,
                         EFI_STATUS status) {
   CHAR16 buf[3 + (sizeof(EFI_STATUS) * 2) + 2];
@@ -59,6 +67,7 @@ static void PrintStatus(SIMPLE_TEXT_OUTPUT_INTERFACE *conOut,
   conOut->OutputString(conOut, buf);
 }
 
+// Build a "Boot####" variable name from a boot option ID.
 static void MakeBootVarName(UINT16 bootId, CHAR16 *name, UINTN nameLen) {
   if (nameLen < 9) {
     return;
@@ -75,6 +84,7 @@ static void MakeBootVarName(UINT16 bootId, CHAR16 *name, UINTN nameLen) {
   name[8] = L'\0';
 }
 
+// Read an EFI variable, allocating a buffer for its contents.
 static EFI_STATUS GetVariableAlloc(EFI_SYSTEM_TABLE *systemTable, CHAR16 *name,
                                    EFI_GUID *guid, UINT8 **data,
                                    UINTN *dataSize) {
@@ -105,6 +115,7 @@ static EFI_STATUS GetVariableAlloc(EFI_SYSTEM_TABLE *systemTable, CHAR16 *name,
   return EFI_SUCCESS;
 }
 
+// Find the next boot option ID after BootCurrent in the BootOrder list.
 static EFI_STATUS GetNextBootOption(EFI_SYSTEM_TABLE *systemTable,
                                     UINT16 *nextBootId) {
   EFI_STATUS status;
@@ -165,6 +176,7 @@ static EFI_STATUS GetNextBootOption(EFI_SYSTEM_TABLE *systemTable,
   return EFI_SUCCESS;
 }
 
+// Check if a device path contains a file path node (needed for LoadImage).
 static BOOLEAN DevicePathHasFilePath(EFI_DEVICE_PATH_PROTOCOL *devicePath) {
   EFI_DEVICE_PATH_PROTOCOL *node = devicePath;
 
@@ -179,6 +191,9 @@ static BOOLEAN DevicePathHasFilePath(EFI_DEVICE_PATH_PROTOCOL *devicePath) {
   return FALSE;
 }
 
+// Chainload to the next boot entry, or fall back to \EFI\BOOT\CHAIN.EFI.
+// First tries the next entry in BootOrder, then falls back to CHAIN.EFI
+// on the same device or any available filesystem.
 static EFI_STATUS ChainloadNext(EFI_HANDLE image, EFI_SYSTEM_TABLE *systemTable,
                                 SIMPLE_TEXT_OUTPUT_INTERFACE *conOut) {
   EFI_STATUS status;
@@ -343,6 +358,7 @@ static EFI_STATUS ChainloadNext(EFI_HANDLE image, EFI_SYSTEM_TABLE *systemTable,
   return status;
 }
 
+// Main entry point: disable BD PROCHOT if on real hardware, then chainload.
 static EFI_STATUS efi_main_sysv(EFI_HANDLE image,
                                 EFI_SYSTEM_TABLE *systemTable) {
   SIMPLE_TEXT_OUTPUT_INTERFACE *conOut;
@@ -362,11 +378,13 @@ static EFI_STATUS efi_main_sysv(EFI_HANDLE image,
   return ChainloadNext(image, systemTable, conOut);
 }
 
+// GNU-EFI entry point (System V ABI).
 EFI_STATUS
 _entry(EFI_HANDLE image, EFI_SYSTEM_TABLE *systemTable) {
   return efi_main_sysv(image, systemTable);
 }
 
+// Standard EFI entry point (MS ABI).
 EFI_STATUS __attribute__((ms_abi)) efi_main(EFI_HANDLE image,
                                             EFI_SYSTEM_TABLE *systemTable) {
   return efi_main_sysv(image, systemTable);
