@@ -1,76 +1,43 @@
 #!/bin/bash
 
-gcc -I/usr/include/efi -I/usr/include/efi/x86_64 \
-    -DHAVE_USE_MS_ABI -Dx86_64 \
-    -fPIC -fshort-wchar -ffreestanding -fno-stack-protector -maccumulate-outgoing-args \
-    -Wall -Werror \
-    -m64 -mno-red-zone \
-	-O3 \
-    -c -o DisablePROCHOT.o DisablePROCHOT.c
+build_efi() {
+	local name="$1"
+	local src="$2"
+	local libs="$3"
+	local dest="$4"
 
-ld -T /usr/lib/elf_x86_64_efi.lds -Bsymbolic -shared -nostdlib -znocombreloc \
-    /usr/lib/crt0-efi-x86_64.o \
-    -o DisablePROCHOT.so DisablePROCHOT.o \
-    $(gcc -print-libgcc-file-name) /usr/lib/libgnuefi.a /usr/lib/libefi.a
+	# drop -O3 to debug
+	gcc -I/usr/include/efi -I/usr/include/efi/x86_64 \
+		-DHAVE_USE_MS_ABI -Dx86_64 \
+		-fPIC -fshort-wchar -ffreestanding -fno-stack-protector -maccumulate-outgoing-args \
+		-Wall -Werror \
+		-m64 -mno-red-zone -O3 \
+		-c -o "${name}.o" "$src"
 
-objcopy -j .text -j .sdata -j .rodata -j .data -j .dynamic -j .dynsym -j .rel \
-        -j .rela -j .reloc -S --target=efi-app-x86_64 \
-        --stack 0x20000,0x20000 \
-        DisablePROCHOT.so DisablePROCHOT.efi
+	ld -T /usr/lib/elf_x86_64_efi.lds -Bsymbolic -shared -nostdlib -znocombreloc \
+		/usr/lib/crt0-efi-x86_64.o \
+		-o "${name}.so" "${name}.o" \
+		$(gcc -print-libgcc-file-name) $libs
 
-rm DisablePROCHOT.o DisablePROCHOT.so
+	objcopy -j .text -j .sdata -j .rodata -j .data -j .dynamic -j .dynsym -j .rel \
+		-j .rela -j .reloc -S --target=efi-app-x86_64 \
+		--stack 0x20000,0x20000 \
+		"${name}.so" "${name}.efi"
 
-echo "Built DisablePROCHOT.efi"
-ls -l DisablePROCHOT.efi
-md5sum DisablePROCHOT.efi
+	rm "${name}.o" "${name}.so"
 
-gcc -I/usr/include/efi -I/usr/include/efi/x86_64 \
-    -DHAVE_USE_MS_ABI -Dx86_64 \
-    -fPIC -fshort-wchar -ffreestanding -fno-stack-protector -maccumulate-outgoing-args \
-    -Wall -Werror \
-    -m64 -mno-red-zone \
-	-O3 \
-    -c -o ChainSuccess.o ChainSuccess.c
+	if [ -n "$dest" ]; then
+		mv "${name}.efi" "$dest"
+		echo "Built ${dest}"
+		ls -l "$dest"
+		md5sum "$dest"
+	else
+		echo "Built ${name}.efi"
+		ls -l "${name}.efi"
+		md5sum "${name}.efi"
+	fi
+}
 
-ld -T /usr/lib/elf_x86_64_efi.lds -Bsymbolic -shared -nostdlib -znocombreloc \
-    /usr/lib/crt0-efi-x86_64.o \
-    -o ChainSuccess.so ChainSuccess.o \
-    $(gcc -print-libgcc-file-name) /usr/lib/libgnuefi.a
-
-objcopy -j .text -j .sdata -j .rodata -j .data -j .dynamic -j .dynsym -j .rel \
-        -j .rela -j .reloc -S --target=efi-app-x86_64 \
-        --stack 0x20000,0x20000 \
-        ChainSuccess.so ChainSuccess.efi
-
-echo "Built ChainSuccess.efi (for tests)"
-ls -l ChainSuccess.efi
-md5sum ChainSuccess.efi
-
-rm ChainSuccess.o ChainSuccess.so
-mv ChainSuccess.efi ./test/ChainSuccess.efi
-
-# Build SetBootOrder.efi (test harness)
-gcc -I/usr/include/efi -I/usr/include/efi/x86_64 \
-    -DHAVE_USE_MS_ABI -Dx86_64 \
-    -fPIC -fshort-wchar -ffreestanding -fno-stack-protector -maccumulate-outgoing-args \
-    -Wall -Werror \
-    -m64 -mno-red-zone \
-    -O3 \
-    -c -o SetBootOrder.o test/SetBootOrder.c
-
-ld -T /usr/lib/elf_x86_64_efi.lds -Bsymbolic -shared -nostdlib -znocombreloc \
-    /usr/lib/crt0-efi-x86_64.o \
-    -o SetBootOrder.so SetBootOrder.o \
-    $(gcc -print-libgcc-file-name) /usr/lib/libgnuefi.a /usr/lib/libefi.a
-
-objcopy -j .text -j .sdata -j .rodata -j .data -j .dynamic -j .dynsym -j .rel \
-        -j .rela -j .reloc -S --target=efi-app-x86_64 \
-        --stack 0x20000,0x20000 \
-        SetBootOrder.so SetBootOrder.efi
-
-echo "Built SetBootOrder.efi (test harness)"
-ls -l SetBootOrder.efi
-md5sum SetBootOrder.efi
-
-rm SetBootOrder.o SetBootOrder.so
-mv SetBootOrder.efi ./test/SetBootOrder.efi
+build_efi "DisablePROCHOT" "DisablePROCHOT.c" "/usr/lib/libgnuefi.a /usr/lib/libefi.a"
+build_efi "ChainSuccess" "test/ChainSuccess.c" "/usr/lib/libgnuefi.a" "./test/ChainSuccess.efi"
+build_efi "SetBootOrder" "test/SetBootOrder.c" "/usr/lib/libgnuefi.a /usr/lib/libefi.a" "./test/SetBootOrder.efi"
