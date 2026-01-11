@@ -1,4 +1,4 @@
-# Compiler flags
+# Compiler flags, mostly for clangd to include the right headers
 -I/usr/include/efi
 -I/usr/include/efi/x86_64
 -DHAVE_USE_MS_ABI

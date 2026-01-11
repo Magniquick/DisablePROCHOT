@@ -1,7 +1,7 @@
 // Copyright (c) 2018 Park Ju Hyung
 //
 // EFI application to disable BD PROCHOT (bi-directional processor hot)
-// throttling, then chainload to the next boot entry or fallback EFI app.
+// throttling, then chainload to the next boot entry.
 
 #include <efi.h>
 #include <efilib.h>
@@ -40,29 +40,6 @@ static CHAR16 HexDigit(UINTN val) {
     return (CHAR16)(L'0' + val);
   }
   return (CHAR16)(L'A' + (val - 10));
-}
-
-// Print an EFI_STATUS value as hex to the console for debugging.
-static void PrintStatus(SIMPLE_TEXT_OUTPUT_INTERFACE *conOut,
-                        EFI_STATUS status) {
-  // " 0x" (3) + hex digits (sizeof*2) + "\r\n\0" (3)
-  CHAR16 buf[3 + (sizeof(EFI_STATUS) * 2) + 3];
-  UINTN pos = 0;
-
-  buf[pos++] = L' ';
-  buf[pos++] = L'0';
-  buf[pos++] = L'x';
-  // Extract each nibble (4 bits) from most-significant to least-significant.
-  // For 64-bit status: i=0 gives shift=60 (top nibble), i=15 gives shift=0.
-  for (UINTN i = 0; i < sizeof(EFI_STATUS) * 2; ++i) {
-    UINTN shift = (sizeof(EFI_STATUS) * 2 - 1 - i) * 4;
-    buf[pos++] = HexDigit((status >> shift) & 0xF);
-  }
-  buf[pos++] = L'\r';
-  buf[pos++] = L'\n';
-  buf[pos] = L'\0';
-
-  conOut->OutputString(conOut, buf);
 }
 
 // Build a "Boot####" variable name from a boot option ID.
@@ -189,171 +166,113 @@ static BOOLEAN DevicePathHasFilePath(EFI_DEVICE_PATH_PROTOCOL *devicePath) {
   return FALSE;
 }
 
-// Chainload to the next boot entry, or fall back to \EFI\BOOT\CHAIN.EFI.
-// First tries the next entry in BootOrder, then falls back to CHAIN.EFI
-// on the same device or any available filesystem.
-static EFI_STATUS ChainloadNext(EFI_HANDLE image, EFI_SYSTEM_TABLE *systemTable,
-                                SIMPLE_TEXT_OUTPUT_INTERFACE *conOut) {
+// Parse a Boot#### variable and extract the device path.
+// EFI_LOAD_OPTION layout: [Attributes][FilePathListLength][Description\0][FilePath...]
+// Returns NULL if parsing fails or the path has no file component.
+static EFI_DEVICE_PATH_PROTOCOL *ParseBootOption(UINT8 *bootData,
+                                                  UINTN bootSize) {
+  EFI_LOAD_OPTION_HEADER *header;
+  UINT8 *descPtr;
+  CHAR16 *description;
+  UINTN descMax, descLen;
+  UINT8 *filePath;
+  EFI_DEVICE_PATH_PROTOCOL *devicePath;
+
+  if (bootSize < sizeof(EFI_LOAD_OPTION_HEADER) + sizeof(CHAR16)) {
+    return NULL;
+  }
+
+  header = (EFI_LOAD_OPTION_HEADER *)bootData;
+  descPtr = bootData + sizeof(EFI_LOAD_OPTION_HEADER);
+  description = (CHAR16 *)descPtr;
+
+  // Find null terminator in description string.
+  descMax = (bootSize - (UINTN)(descPtr - bootData)) / sizeof(CHAR16);
+  for (descLen = 0; descLen < descMax; ++descLen) {
+    if (description[descLen] == L'\0') {
+      break;
+    }
+  }
+  if (descLen == descMax) {
+    return NULL;  // No null terminator
+  }
+
+  // FilePath starts after the null-terminated description.
+  filePath = (UINT8 *)(description + descLen + 1);
+  if ((UINTN)(filePath - bootData) + header->FilePathListLength > bootSize ||
+      header->FilePathListLength == 0) {
+    return NULL;
+  }
+
+  devicePath = (EFI_DEVICE_PATH_PROTOCOL *)filePath;
+  if (!DevicePathHasFilePath(devicePath)) {
+    return NULL;  // Device-only path, can't chainload
+  }
+
+  return devicePath;
+}
+
+// Chainload the next entry in BootOrder.
+// Returns EFI_SUCCESS if chainload succeeded (and started image returned).
+static EFI_STATUS TryBootOrderChainload(EFI_HANDLE image,
+                                        EFI_SYSTEM_TABLE *systemTable,
+                                        SIMPLE_TEXT_OUTPUT_INTERFACE *conOut) {
   EFI_STATUS status;
   UINT16 nextBootId;
   CHAR16 bootVarName[9];
   UINT8 *bootData = NULL;
   UINTN bootSize = 0;
-  EFI_LOAD_OPTION_HEADER *header;
-  UINT8 *descPtr;
-  CHAR16 *description;
-  UINTN descMax;
-  UINTN descLen = 0;
-  UINT8 *filePath;
   EFI_DEVICE_PATH_PROTOCOL *devicePath;
   EFI_HANDLE nextImage;
-  EFI_LOADED_IMAGE *loadedImage = NULL;
-  EFI_DEVICE_PATH_PROTOCOL *fallbackPath = NULL;
-  EFI_HANDLE *fsHandles = NULL;
-  UINTN fsHandleCount = 0;
-  EFI_STATUS imgStatus;
-
-  imgStatus =
-      uefi_call_wrapper(systemTable->BootServices->OpenProtocol, 6, image,
-                        &gEfiLoadedImageProtocolGuid, (void **)&loadedImage,
-                        image, NULL, EFI_OPEN_PROTOCOL_GET_PROTOCOL);
 
   status = GetNextBootOption(systemTable, &nextBootId);
   if (status == EFI_NOT_FOUND) {
     conOut->OutputString(conOut, L"No next boot entry\r\n");
+    return status;
   }
   if (EFI_ERROR(status)) {
     conOut->OutputString(conOut, L"BootOrder unavailable\r\n");
+    return status;
   }
 
-  if (!EFI_ERROR(status)) {
-    MakeBootVarName(nextBootId, bootVarName,
-                    sizeof(bootVarName) / sizeof(CHAR16));
-    status = GetVariableAlloc(systemTable, bootVarName, &gEfiGlobalVariableGuid,
-                              &bootData, &bootSize);
-    if (!EFI_ERROR(status)) {
-      if (bootSize < sizeof(EFI_LOAD_OPTION_HEADER) + sizeof(CHAR16)) {
-        status = EFI_COMPROMISED_DATA;
-      } else {
-        header = (EFI_LOAD_OPTION_HEADER *)bootData;
-        descPtr = bootData + sizeof(EFI_LOAD_OPTION_HEADER);
-        description = (CHAR16 *)descPtr;
-        descMax = (bootSize - (UINTN)(descPtr - bootData)) / sizeof(CHAR16);
-        for (descLen = 0; descLen < descMax; ++descLen) {
-          if (description[descLen] == L'\0') {
-            break;
-          }
-        }
-        if (descLen == descMax) {
-          status = EFI_COMPROMISED_DATA;
-        } else {
-          filePath = (UINT8 *)(description + descLen + 1);
-          if ((UINTN)(filePath - bootData) + header->FilePathListLength >
-                  bootSize ||
-              header->FilePathListLength == 0) {
-            status = EFI_COMPROMISED_DATA;
-          } else {
-            devicePath = (EFI_DEVICE_PATH_PROTOCOL *)filePath;
-            if (!DevicePathHasFilePath(devicePath)) {
-              status = EFI_UNSUPPORTED;
-            } else {
-              conOut->OutputString(conOut, L"Chainloading next boot entry\r\n");
-              status = uefi_call_wrapper(systemTable->BootServices->LoadImage,
-                                         6, FALSE, image, devicePath, NULL, 0,
-                                         &nextImage);
-              if (!EFI_ERROR(status)) {
-                status =
-                    uefi_call_wrapper(systemTable->BootServices->StartImage, 3,
-                                      nextImage, NULL, NULL);
-                if (EFI_ERROR(status)) {
-                  conOut->OutputString(conOut, L"StartImage failed\r\n");
-                }
-                uefi_call_wrapper(systemTable->BootServices->FreePool, 1,
-                                  bootData);
-                return status;
-              } else {
-                conOut->OutputString(conOut, L"LoadImage failed\r\n");
-              }
-            }
-          }
-        }
-      }
-    } else {
-      conOut->OutputString(conOut, L"Boot option missing\r\n");
-    }
+  // Read the Boot#### variable.
+  MakeBootVarName(nextBootId, bootVarName, sizeof(bootVarName) / sizeof(CHAR16));
+  status = GetVariableAlloc(systemTable, bootVarName, &gEfiGlobalVariableGuid,
+                            &bootData, &bootSize);
+  if (EFI_ERROR(status)) {
+    conOut->OutputString(conOut, L"Boot option missing\r\n");
+    return status;
   }
 
-  if (bootData) {
+  devicePath = ParseBootOption(bootData, bootSize);
+  if (!devicePath) {
     uefi_call_wrapper(systemTable->BootServices->FreePool, 1, bootData);
+    return EFI_COMPROMISED_DATA;
   }
 
-  if (EFI_ERROR(imgStatus)) {
-    conOut->OutputString(conOut, L"OpenProtocol(LoadedImage) failed\r\n");
-    PrintStatus(conOut, imgStatus);
+  conOut->OutputString(conOut, L"Chainloading next boot entry\r\n");
+  status = uefi_call_wrapper(systemTable->BootServices->LoadImage, 6, FALSE,
+                             image, devicePath, NULL, 0, &nextImage);
+  if (EFI_ERROR(status)) {
+    conOut->OutputString(conOut, L"LoadImage failed\r\n");
+    uefi_call_wrapper(systemTable->BootServices->FreePool, 1, bootData);
+    return status;
   }
 
-  if (loadedImage) {
-    fallbackPath =
-        FileDevicePath(loadedImage->DeviceHandle, L"\\EFI\\BOOT\\CHAIN.EFI");
-  } else {
-    status = uefi_call_wrapper(systemTable->BootServices->LocateHandleBuffer, 5,
-                               ByProtocol, &gEfiSimpleFileSystemProtocolGuid,
-                               NULL, &fsHandleCount, &fsHandles);
-    if (!EFI_ERROR(status) && fsHandleCount > 0) {
-      fallbackPath = FileDevicePath(fsHandles[0], L"\\EFI\\BOOT\\CHAIN.EFI");
-    } else {
-      conOut->OutputString(conOut, L"LocateHandleBuffer(SimpleFS) failed\r\n");
-      PrintStatus(conOut, status);
-      // Try to connect all controllers then retry SimpleFS
-      if (status == EFI_NOT_FOUND) {
-        EFI_HANDLE *allHandles = NULL;
-        UINTN allCount = 0;
-        status =
-            uefi_call_wrapper(systemTable->BootServices->LocateHandleBuffer, 5,
-                              AllHandles, NULL, NULL, &allCount, &allHandles);
-        if (!EFI_ERROR(status) && allCount > 0 && allHandles) {
-          UINTN idx;
-          for (idx = 0; idx < allCount; ++idx) {
-            uefi_call_wrapper(systemTable->BootServices->ConnectController, 5,
-                              allHandles[idx], NULL, NULL, TRUE);
-          }
-          uefi_call_wrapper(systemTable->BootServices->FreePool, 1, allHandles);
-          status = uefi_call_wrapper(
-              systemTable->BootServices->LocateHandleBuffer, 5, ByProtocol,
-              &gEfiSimpleFileSystemProtocolGuid, NULL, &fsHandleCount,
-              &fsHandles);
-          if (!EFI_ERROR(status) && fsHandleCount > 0) {
-            fallbackPath =
-                FileDevicePath(fsHandles[0], L"\\EFI\\BOOT\\CHAIN.EFI");
-          }
-        }
-      }
-    }
-    if (fsHandles) {
-      uefi_call_wrapper(systemTable->BootServices->FreePool, 1, fsHandles);
-    }
-  }
+  uefi_call_wrapper(systemTable->BootServices->FreePool, 1, bootData);
 
-  if (fallbackPath) {
-    conOut->OutputString(conOut,
-                         L"Fallback chain to \\EFI\\BOOT\\CHAIN.EFI\r\n");
-    status = uefi_call_wrapper(systemTable->BootServices->LoadImage, 6, FALSE,
-                               image, fallbackPath, NULL, 0, &nextImage);
-    if (!EFI_ERROR(status)) {
-      status = uefi_call_wrapper(systemTable->BootServices->StartImage, 3,
-                                 nextImage, NULL, NULL);
-      if (EFI_ERROR(status)) {
-        conOut->OutputString(conOut, L"StartImage failed\r\n");
-      }
-      return status;
-    } else {
-      conOut->OutputString(conOut, L"Fallback LoadImage failed\r\n");
-    }
-  } else {
-    conOut->OutputString(conOut, L"No fallback device path\r\n");
+  status = uefi_call_wrapper(systemTable->BootServices->StartImage, 3,
+                             nextImage, NULL, NULL);
+  if (EFI_ERROR(status)) {
+    conOut->OutputString(conOut, L"StartImage failed\r\n");
   }
-
   return status;
+}
+
+// Chainload to the next boot entry.
+static EFI_STATUS ChainloadNext(EFI_HANDLE image, EFI_SYSTEM_TABLE *systemTable,
+                                SIMPLE_TEXT_OUTPUT_INTERFACE *conOut) {
+  return TryBootOrderChainload(image, systemTable, conOut);
 }
 
 // Main entry point: disable BD PROCHOT if on real hardware, then chainload.
