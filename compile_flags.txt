@@ -1,0 +1,11 @@
+# Compiler flags
+-I/usr/include/efi
+-I/usr/include/efi/x86_64
+-DHAVE_USE_MS_ABI
+-Dx86_64
+-fPIC
+-fshort-wchar
+-ffreestanding
+-fno-stack-protector
+-m64
+-mno-red-zone
