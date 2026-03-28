@@ -1,5 +1,7 @@
 # DisablePROCHOT
 
+[Build workflow](https://github.com/Magniquick/DisablePROCHOT/actions/workflows/build.yml) | [Releases](https://github.com/Magniquick/DisablePROCHOT/releases)
+
 `DisablePROCHOT` is a small x86_64 UEFI application that clears the BD PROCHOT control bit at boot, then chains to the next UEFI boot entry.
 
 BD PROCHOT (Bi-Directional PROCHOT) can force very low CPU clocks (for example ~400 MHz) when platform firmware or sensors assert thermal throttling. This project is useful when BD PROCHOT is being triggered incorrectly.
