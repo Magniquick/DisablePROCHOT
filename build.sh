@@ -20,7 +20,7 @@ build_efi() {
 		$(gcc -print-libgcc-file-name) $libs
 
 	objcopy -j .text -j .sdata -j .rodata -j .data -j .dynamic -j .dynsym -j .rel \
-		-j .rela -j .reloc -S --target=efi-app-x86_64 \
+		-j .rela -j .reloc -S -O pei-x86-64 --subsystem=efi-app \
 		--stack 0x20000,0x20000 \
 		"${name}.so" "${name}.efi"
 
