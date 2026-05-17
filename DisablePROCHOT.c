@@ -90,9 +90,13 @@ static EFI_STATUS GetVariableAlloc(EFI_SYSTEM_TABLE *systemTable, CHAR16 *name,
   return EFI_SUCCESS;
 }
 
-// Find the next boot option ID after BootCurrent in the BootOrder list.
+static EFI_DEVICE_PATH_PROTOCOL *ParseBootOption(UINT8 *bootData,
+                                                  UINTN bootSize);
+
+// Find the next loadable boot option ID after BootCurrent in the BootOrder list.
 static EFI_STATUS GetNextBootOption(EFI_SYSTEM_TABLE *systemTable,
-                                    UINT16 *nextBootId) {
+                                    UINTN startOffset, UINT16 *nextBootId,
+                                    UINTN *nextOffset) {
   EFI_STATUS status;
   UINT8 *bootOrderData = NULL;
   UINTN bootOrderSize = 0;
@@ -145,10 +149,38 @@ static EFI_STATUS GetNextBootOption(EFI_SYSTEM_TABLE *systemTable,
     return EFI_NOT_FOUND;
   }
 
-  *nextBootId = bootOrder[(currentIndex + 1) % bootCount];
+  if (startOffset >= bootCount) {
+    uefi_call_wrapper(systemTable->BootServices->FreePool, 1, bootOrderData);
+    return EFI_NOT_FOUND;
+  }
+
+  for (i = startOffset; i < bootCount; ++i) {
+    UINT16 bootId = bootOrder[(currentIndex + i) % bootCount];
+    CHAR16 bootVarName[9];
+    UINT8 *bootData = NULL;
+    UINTN bootSize = 0;
+
+    MakeBootVarName(bootId, bootVarName,
+                    sizeof(bootVarName) / sizeof(CHAR16));
+    status = GetVariableAlloc(systemTable, bootVarName, &gEfiGlobalVariableGuid,
+                              &bootData, &bootSize);
+    if (EFI_ERROR(status)) {
+      continue;
+    }
+
+    if (ParseBootOption(bootData, bootSize)) {
+      *nextBootId = bootId;
+      *nextOffset = i;
+      uefi_call_wrapper(systemTable->BootServices->FreePool, 1, bootData);
+      uefi_call_wrapper(systemTable->BootServices->FreePool, 1, bootOrderData);
+      return EFI_SUCCESS;
+    }
+
+    uefi_call_wrapper(systemTable->BootServices->FreePool, 1, bootData);
+  }
 
   uefi_call_wrapper(systemTable->BootServices->FreePool, 1, bootOrderData);
-  return EFI_SUCCESS;
+  return EFI_NOT_FOUND;
 }
 
 // Check if a device path contains a file path node (needed for LoadImage).
@@ -183,6 +215,10 @@ static EFI_DEVICE_PATH_PROTOCOL *ParseBootOption(UINT8 *bootData,
   }
 
   header = (EFI_LOAD_OPTION_HEADER *)bootData;
+  if ((header->Attributes & LOAD_OPTION_ACTIVE) == 0) {
+    return NULL;
+  }
+
   descPtr = bootData + sizeof(EFI_LOAD_OPTION_HEADER);
   description = (CHAR16 *)descPtr;
 
@@ -219,54 +255,58 @@ static EFI_STATUS TryBootOrderChainload(EFI_HANDLE image,
                                         SIMPLE_TEXT_OUTPUT_INTERFACE *conOut) {
   EFI_STATUS status;
   UINT16 nextBootId;
+  UINTN offset = 1;
+  UINTN nextOffset = 0;
   CHAR16 bootVarName[9];
   UINT8 *bootData = NULL;
   UINTN bootSize = 0;
   EFI_DEVICE_PATH_PROTOCOL *devicePath;
   EFI_HANDLE nextImage;
 
-  status = GetNextBootOption(systemTable, &nextBootId);
-  if (status == EFI_NOT_FOUND) {
-    conOut->OutputString(conOut, L"No next boot entry\r\n");
-    return status;
-  }
-  if (EFI_ERROR(status)) {
-    conOut->OutputString(conOut, L"BootOrder unavailable\r\n");
-    return status;
-  }
+  for (;;) {
+    status = GetNextBootOption(systemTable, offset, &nextBootId, &nextOffset);
+    if (status == EFI_NOT_FOUND) {
+      conOut->OutputString(conOut, L"No next boot entry\r\n");
+      return status;
+    }
+    if (EFI_ERROR(status)) {
+      conOut->OutputString(conOut, L"BootOrder unavailable\r\n");
+      return status;
+    }
+    offset = nextOffset + 1;
 
-  // Read the Boot#### variable.
-  MakeBootVarName(nextBootId, bootVarName, sizeof(bootVarName) / sizeof(CHAR16));
-  status = GetVariableAlloc(systemTable, bootVarName, &gEfiGlobalVariableGuid,
-                            &bootData, &bootSize);
-  if (EFI_ERROR(status)) {
-    conOut->OutputString(conOut, L"Boot option missing\r\n");
-    return status;
-  }
+    // Read the Boot#### variable.
+    MakeBootVarName(nextBootId, bootVarName,
+                    sizeof(bootVarName) / sizeof(CHAR16));
+    status = GetVariableAlloc(systemTable, bootVarName, &gEfiGlobalVariableGuid,
+                              &bootData, &bootSize);
+    if (EFI_ERROR(status)) {
+      continue;
+    }
 
-  devicePath = ParseBootOption(bootData, bootSize);
-  if (!devicePath) {
+    devicePath = ParseBootOption(bootData, bootSize);
+    if (!devicePath) {
+      uefi_call_wrapper(systemTable->BootServices->FreePool, 1, bootData);
+      continue;
+    }
+
+    conOut->OutputString(conOut, L"Chainloading next boot entry\r\n");
+    status = uefi_call_wrapper(systemTable->BootServices->LoadImage, 6, FALSE,
+                               image, devicePath, NULL, 0, &nextImage);
     uefi_call_wrapper(systemTable->BootServices->FreePool, 1, bootData);
-    return EFI_COMPROMISED_DATA;
-  }
+    bootData = NULL;
+    if (EFI_ERROR(status)) {
+      continue;
+    }
 
-  conOut->OutputString(conOut, L"Chainloading next boot entry\r\n");
-  status = uefi_call_wrapper(systemTable->BootServices->LoadImage, 6, FALSE,
-                             image, devicePath, NULL, 0, &nextImage);
-  if (EFI_ERROR(status)) {
-    conOut->OutputString(conOut, L"LoadImage failed\r\n");
-    uefi_call_wrapper(systemTable->BootServices->FreePool, 1, bootData);
+    status = uefi_call_wrapper(systemTable->BootServices->StartImage, 3,
+                               nextImage, NULL, NULL);
+    if (EFI_ERROR(status)) {
+      continue;
+    }
+
     return status;
   }
-
-  uefi_call_wrapper(systemTable->BootServices->FreePool, 1, bootData);
-
-  status = uefi_call_wrapper(systemTable->BootServices->StartImage, 3,
-                             nextImage, NULL, NULL);
-  if (EFI_ERROR(status)) {
-    conOut->OutputString(conOut, L"StartImage failed\r\n");
-  }
-  return status;
 }
 
 // Chainload to the next boot entry.

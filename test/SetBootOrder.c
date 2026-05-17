@@ -12,6 +12,7 @@ static EFI_STATUS CreateBootOption(EFI_SYSTEM_TABLE *systemTable,
                                    CHAR16 *filePath,
                                    EFI_HANDLE deviceHandle) {
   EFI_STATUS status;
+  UINT8 endDevicePath[] = {0x7f, 0xff, 0x04, 0x00};
   EFI_DEVICE_PATH_PROTOCOL *devicePath;
   UINTN devicePathSize;
   UINTN descSize;
@@ -20,12 +21,16 @@ static EFI_STATUS CreateBootOption(EFI_SYSTEM_TABLE *systemTable,
   UINT8 *ptr;
   CHAR16 varName[9];
 
-  // Build device path for the file.
-  devicePath = FileDevicePath(deviceHandle, filePath);
-  if (!devicePath) {
-    return EFI_OUT_OF_RESOURCES;
+  if (filePath) {
+    devicePath = FileDevicePath(deviceHandle, filePath);
+    if (!devicePath) {
+      return EFI_OUT_OF_RESOURCES;
+    }
+    devicePathSize = DevicePathSize(devicePath);
+  } else {
+    devicePath = (EFI_DEVICE_PATH_PROTOCOL *)endDevicePath;
+    devicePathSize = sizeof(endDevicePath);
   }
-  devicePathSize = DevicePathSize(devicePath);
 
   // Calculate sizes.
   descSize = (StrLen(description) + 1) * sizeof(CHAR16);
@@ -42,7 +47,7 @@ static EFI_STATUS CreateBootOption(EFI_SYSTEM_TABLE *systemTable,
   ptr = buffer;
 
   // Attributes (LOAD_OPTION_ACTIVE = 0x00000001)
-  *(UINT32 *)ptr = 0x00000001;
+  *(UINT32 *)ptr = bootId == 0x0005 ? 0 : 0x00000001;
   ptr += sizeof(UINT32);
 
   // FilePathListLength
@@ -85,8 +90,10 @@ static EFI_STATUS efi_main_impl(EFI_HANDLE image, EFI_SYSTEM_TABLE *systemTable)
   EFI_HANDLE deviceHandle;
   SIMPLE_TEXT_OUTPUT_INTERFACE *conOut = systemTable->ConOut;
   // Boot0002 is what firmware sets BootCurrent to when booting BOOTX64.EFI.
-  // We overwrite Boot0002 to point to DisablePROCHOT, and Boot0003 to ChainSuccess.
-  UINT16 bootOrder[2] = {0x0002, 0x0003};
+  // We overwrite Boot0002 to point to DisablePROCHOT, Boot0006 to a stale
+  // active file entry, Boot0005 to an inactive file entry, Boot0004 to a
+  // device-only placeholder, and Boot0003 to ChainSuccess.
+  UINT16 bootOrder[5] = {0x0002, 0x0006, 0x0005, 0x0004, 0x0003};
   EFI_DEVICE_PATH_PROTOCOL *disablePath;
   EFI_HANDLE disableImage;
 
@@ -113,6 +120,30 @@ static EFI_STATUS efi_main_impl(EFI_HANDLE image, EFI_SYSTEM_TABLE *systemTable)
   }
   conOut->OutputString(conOut, L"Created Boot0002 -> DisablePROCHOT.efi\r\n");
 
+  status = CreateBootOption(systemTable, 0x0004, L"EFI USB Device", NULL,
+                            deviceHandle);
+  if (EFI_ERROR(status)) {
+    conOut->OutputString(conOut, L"Failed to create Boot0004\r\n");
+    return status;
+  }
+  conOut->OutputString(conOut, L"Created Boot0004 -> EFI USB Device\r\n");
+
+  status = CreateBootOption(systemTable, 0x0005, L"Inactive",
+                            L"\\EFI\\BOOT\\Inactive.efi", deviceHandle);
+  if (EFI_ERROR(status)) {
+    conOut->OutputString(conOut, L"Failed to create Boot0005\r\n");
+    return status;
+  }
+  conOut->OutputString(conOut, L"Created Boot0005 -> Inactive\r\n");
+
+  status = CreateBootOption(systemTable, 0x0006, L"Missing",
+                            L"\\EFI\\BOOT\\Missing.efi", deviceHandle);
+  if (EFI_ERROR(status)) {
+    conOut->OutputString(conOut, L"Failed to create Boot0006\r\n");
+    return status;
+  }
+  conOut->OutputString(conOut, L"Created Boot0006 -> Missing\r\n");
+
   // Create Boot0003 -> ChainSuccess.efi
   status = CreateBootOption(systemTable, 0x0003, L"ChainSuccess",
                             L"\\EFI\\BOOT\\ChainSuccess.efi", deviceHandle);
@@ -122,7 +153,7 @@ static EFI_STATUS efi_main_impl(EFI_HANDLE image, EFI_SYSTEM_TABLE *systemTable)
   }
   conOut->OutputString(conOut, L"Created Boot0003 -> ChainSuccess.efi\r\n");
 
-  // Set BootOrder = {0002, 0003}
+  // Set BootOrder = {0002, 0006, 0005, 0004, 0003}
   status = uefi_call_wrapper(systemTable->RuntimeServices->SetVariable, 5,
                              L"BootOrder", &gEfiGlobalVariableGuid,
                              EFI_VARIABLE_NON_VOLATILE |
@@ -133,7 +164,8 @@ static EFI_STATUS efi_main_impl(EFI_HANDLE image, EFI_SYSTEM_TABLE *systemTable)
     conOut->OutputString(conOut, L"Failed to set BootOrder\r\n");
     return status;
   }
-  conOut->OutputString(conOut, L"Set BootOrder = {0002, 0003}\r\n");
+  conOut->OutputString(conOut,
+                       L"Set BootOrder = {0002, 0006, 0005, 0004, 0003}\r\n");
 
   // BootCurrent should already be 0002 (set by firmware when it booted us via BOOTX64.EFI)
   conOut->OutputString(conOut, L"BootCurrent = 0002 (set by firmware)\r\n");
