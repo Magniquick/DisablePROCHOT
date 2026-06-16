@@ -92,8 +92,11 @@ static EFI_STATUS efi_main_impl(EFI_HANDLE image, EFI_SYSTEM_TABLE *systemTable)
   // Boot0002 is what firmware sets BootCurrent to when booting BOOTX64.EFI.
   // We overwrite Boot0002 to point to DisablePROCHOT, Boot0006 to a stale
   // active file entry, Boot0005 to an inactive file entry, Boot0004 to a
-  // device-only placeholder, and Boot0003 to ChainSuccess.
-  UINT16 bootOrder[5] = {0x0002, 0x0006, 0x0005, 0x0004, 0x0003};
+  // device-only placeholder, Boot0003 to ChainSuccess, Boot0000 to a stale
+  // BootCurrent value, and Boot0001 to a wrong target.
+  UINT16 bootOrder[7] = {0x0002, 0x0006, 0x0005, 0x0004,
+                         0x0003, 0x0000, 0x0001};
+  UINT16 staleBootCurrent = 0x0000;
   EFI_DEVICE_PATH_PROTOCOL *disablePath;
   EFI_HANDLE disableImage;
 
@@ -119,6 +122,22 @@ static EFI_STATUS efi_main_impl(EFI_HANDLE image, EFI_SYSTEM_TABLE *systemTable)
     return status;
   }
   conOut->OutputString(conOut, L"Created Boot0002 -> DisablePROCHOT.efi\r\n");
+
+  status = CreateBootOption(systemTable, 0x0000, L"StaleCurrent",
+                            L"\\EFI\\BOOT\\Missing.efi", deviceHandle);
+  if (EFI_ERROR(status)) {
+    conOut->OutputString(conOut, L"Failed to create Boot0000\r\n");
+    return status;
+  }
+  conOut->OutputString(conOut, L"Created Boot0000 -> StaleCurrent\r\n");
+
+  status = CreateBootOption(systemTable, 0x0001, L"WrongTarget",
+                            L"\\EFI\\BOOT\\WrongTarget.efi", deviceHandle);
+  if (EFI_ERROR(status)) {
+    conOut->OutputString(conOut, L"Failed to create Boot0001\r\n");
+    return status;
+  }
+  conOut->OutputString(conOut, L"Created Boot0001 -> WrongTarget.efi\r\n");
 
   status = CreateBootOption(systemTable, 0x0004, L"EFI USB Device", NULL,
                             deviceHandle);
@@ -153,7 +172,7 @@ static EFI_STATUS efi_main_impl(EFI_HANDLE image, EFI_SYSTEM_TABLE *systemTable)
   }
   conOut->OutputString(conOut, L"Created Boot0003 -> ChainSuccess.efi\r\n");
 
-  // Set BootOrder = {0002, 0006, 0005, 0004, 0003}
+  // Set BootOrder = {0002, 0006, 0005, 0004, 0003, 0000, 0001}
   status = uefi_call_wrapper(systemTable->RuntimeServices->SetVariable, 5,
                              L"BootOrder", &gEfiGlobalVariableGuid,
                              EFI_VARIABLE_NON_VOLATILE |
@@ -165,10 +184,18 @@ static EFI_STATUS efi_main_impl(EFI_HANDLE image, EFI_SYSTEM_TABLE *systemTable)
     return status;
   }
   conOut->OutputString(conOut,
-                       L"Set BootOrder = {0002, 0006, 0005, 0004, 0003}\r\n");
+                       L"Set BootOrder = {0002, 0006, 0005, 0004, 0003, 0000, 0001}\r\n");
 
-  // BootCurrent should already be 0002 (set by firmware when it booted us via BOOTX64.EFI)
-  conOut->OutputString(conOut, L"BootCurrent = 0002 (set by firmware)\r\n");
+  status = uefi_call_wrapper(systemTable->RuntimeServices->SetVariable, 5,
+                             L"BootCurrent", &gEfiGlobalVariableGuid,
+                             EFI_VARIABLE_BOOTSERVICE_ACCESS |
+                             EFI_VARIABLE_RUNTIME_ACCESS,
+                             sizeof(staleBootCurrent), &staleBootCurrent);
+  if (EFI_ERROR(status)) {
+    conOut->OutputString(conOut, L"Failed to set stale BootCurrent\r\n");
+    return status;
+  }
+  conOut->OutputString(conOut, L"BootCurrent = 0000 (stale test value)\r\n");
 
   // Now load and start DisablePROCHOT.efi
   conOut->OutputString(conOut, L"Launching DisablePROCHOT.efi...\r\n");

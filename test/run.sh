@@ -48,4 +48,6 @@ env TMPDIR="${TMP_DIR}" timeout 30s qemu-system-x86_64 \
 grep -q "Created Boot0004 -> EFI USB Device" "${LOG_FILE}"
 grep -q "Created Boot0005 -> Inactive" "${LOG_FILE}"
 grep -q "Created Boot0006 -> Missing" "${LOG_FILE}"
+grep -q "BootCurrent = 0000 (stale test value)" "${LOG_FILE}"
+! grep -q "Wrong chainload target" "${LOG_FILE}"
 grep -q "Chainload successful" "${LOG_FILE}"

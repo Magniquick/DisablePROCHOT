@@ -5,6 +5,7 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 ESP_IMG="${ROOT_DIR}/test/esp.img"
 EFI_DISABLE="${ROOT_DIR}/DisablePROCHOT.efi"
 EFI_CHAIN="${ROOT_DIR}/test/ChainSuccess.efi"
+EFI_WRONG="${ROOT_DIR}/test/WrongTarget.efi"
 EFI_SETBOOT="${ROOT_DIR}/test/SetBootOrder.efi"
 SIZE_MB=64
 
@@ -19,7 +20,7 @@ need mkfs.vfat
 need mcopy
 need mmd
 
-if [ ! -f "${EFI_DISABLE}" ] || [ ! -f "${EFI_CHAIN}" ] || [ ! -f "${EFI_SETBOOT}" ]; then
+if [ ! -f "${EFI_DISABLE}" ] || [ ! -f "${EFI_CHAIN}" ] || [ ! -f "${EFI_WRONG}" ] || [ ! -f "${EFI_SETBOOT}" ]; then
 	echo "Missing EFI binaries. Run ./build.sh first." >&2
 	exit 1
 fi
@@ -36,3 +37,4 @@ MTOOLS_SKIP_CHECK=1 mcopy -i "${ESP_IMG}" "${EFI_SETBOOT}" ::/EFI/BOOT/BOOTX64.E
 # DisablePROCHOT.efi and ChainSuccess.efi are chainloaded via BootOrder
 MTOOLS_SKIP_CHECK=1 mcopy -i "${ESP_IMG}" "${EFI_DISABLE}" ::/EFI/BOOT/DisablePROCHOT.efi
 MTOOLS_SKIP_CHECK=1 mcopy -i "${ESP_IMG}" "${EFI_CHAIN}" ::/EFI/BOOT/ChainSuccess.efi
+MTOOLS_SKIP_CHECK=1 mcopy -i "${ESP_IMG}" "${EFI_WRONG}" ::/EFI/BOOT/WrongTarget.efi

@@ -40,4 +40,5 @@ build_efi() {
 
 build_efi "DisablePROCHOT" "DisablePROCHOT.c" "/usr/lib/libgnuefi.a /usr/lib/libefi.a"
 build_efi "ChainSuccess" "test/ChainSuccess.c" "/usr/lib/libgnuefi.a" "./test/ChainSuccess.efi"
+build_efi "WrongTarget" "test/WrongTarget.c" "/usr/lib/libgnuefi.a" "./test/WrongTarget.efi"
 build_efi "SetBootOrder" "test/SetBootOrder.c" "/usr/lib/libgnuefi.a /usr/lib/libefi.a" "./test/SetBootOrder.efi"
