@@ -1,17 +1,115 @@
 // Copyright (c) 2018 Park Ju Hyung
 //
-// EFI application to disable BD PROCHOT (bi-directional processor hot)
-// throttling, then chainload to the next boot entry.
+// Self-contained variant: gnu-efi headers for TYPES only, no gnu-efi lib, so it
+// can be compiled straight to PE-COFF with clang/lld (no ELF->PE objcopy).
 
 #include <efi.h>
-#include <efilib.h>
+
+#ifndef LOAD_OPTION_ACTIVE
+#define LOAD_OPTION_ACTIVE 0x00000001
+#endif
+
+// ---------------------------------------------------------------------------
+// Minimal gnu-efi-lib replacements (so nothing external needs linking)
+// ---------------------------------------------------------------------------
+static EFI_SYSTEM_TABLE *ST;
+static EFI_BOOT_SERVICES *BS;
+static EFI_RUNTIME_SERVICES *RT;
+static EFI_HANDLE IM;
+
+static EFI_GUID gEfiGlobalVariableGuid = EFI_GLOBAL_VARIABLE;
+static EFI_GUID gEfiLoadedImageProtocolGuid = LOADED_IMAGE_PROTOCOL;
+static EFI_GUID gEfiLoadedImageDevicePathProtocolGuid = {
+    0xbc62157e, 0x3e33, 0x4fec, {0x99, 0x20, 0x2d, 0x3b, 0x36, 0xd7, 0x50, 0xdf}};
+static EFI_GUID gEfiDevicePathProtocolGuid = {
+    0x09576e91, 0x6d3f, 0x11d2, {0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b}};
+
+static void Output(CHAR16 *s) { ST->ConOut->OutputString(ST->ConOut, s); }
+
+static INTN CompareMem(const void *a, const void *b, UINTN n) {
+  const UINT8 *x = a, *y = b;
+  for (UINTN i = 0; i < n; i++)
+    if (x[i] != y[i]) return (INTN)x[i] - (INTN)y[i];
+  return 0;
+}
+
+static void CopyMem(void *d, const void *s, UINTN n) {
+  UINT8 *dd = d;
+  const UINT8 *ss = s;
+  for (UINTN i = 0; i < n; i++) dd[i] = ss[i];
+}
+
+static void FreePool(void *p) { BS->FreePool(p); }
+
+static UINTN DevicePathSize(EFI_DEVICE_PATH_PROTOCOL *dp) {
+  EFI_DEVICE_PATH_PROTOCOL *n = dp;
+  UINTN sz = 0;
+  while (n) {
+    UINTN l = (UINTN)DevicePathNodeLength(n);
+    if (l < sizeof(EFI_DEVICE_PATH_PROTOCOL)) return 0;
+    sz += l;
+    if (IsDevicePathEnd(n)) return sz;
+    n = NextDevicePathNode(n);
+  }
+  return 0;
+}
+
+static EFI_DEVICE_PATH_PROTOCOL *FindFilePathNode(EFI_DEVICE_PATH_PROTOCOL *dp);
+
+// This firmware's Boot#### entries are short-form (HD(sig)/File, no hardware
+// prefix) and its LoadImage won't expand them (EFI_NOT_FOUND). Rebuild a FULL
+// path: the device path of the partition we were loaded from + the target's
+// File node + End. Returns NULL on failure (caller falls back to short-form).
+static EFI_DEVICE_PATH_PROTOCOL *BuildFullPath(EFI_DEVICE_PATH_PROTOCOL *target) {
+  EFI_LOADED_IMAGE *li = NULL;
+  EFI_DEVICE_PATH_PROTOCOL *devDp = NULL, *targFile, *out;
+  UINTN devLen, tlen;
+  UINT8 *p;
+
+  if (EFI_ERROR(BS->HandleProtocol(IM, &gEfiLoadedImageProtocolGuid, (void **)&li)) || !li)
+    return NULL;
+  if (EFI_ERROR(BS->HandleProtocol(li->DeviceHandle, &gEfiDevicePathProtocolGuid,
+                                   (void **)&devDp)) ||
+      !devDp)
+    return NULL;
+  targFile = FindFilePathNode(target);
+  if (!targFile) return NULL;
+
+  devLen = DevicePathSize(devDp);
+  if (devLen < 4) return NULL;
+  devLen -= 4;  // strip the partition path's End node
+  tlen = (UINTN)DevicePathNodeLength(targFile);
+
+  if (EFI_ERROR(BS->AllocatePool(EfiLoaderData, devLen + tlen + 4, (void **)&out)) || !out)
+    return NULL;
+  p = (UINT8 *)out;
+  CopyMem(p, devDp, devLen);             // hardware path to our partition
+  CopyMem(p + devLen, targFile, tlen);   // target's File node
+  p[devLen + tlen + 0] = 0x7f;           // End-of-device-path
+  p[devLen + tlen + 1] = 0xff;
+  p[devLen + tlen + 2] = 0x04;
+  p[devLen + tlen + 3] = 0x00;
+  return out;
+}
+
+static void *LibGetVariableAndSize(CHAR16 *name, EFI_GUID *g, UINTN *sz) {
+  UINTN s = 0;
+  *sz = 0;
+  EFI_STATUS st = RT->GetVariable(name, g, NULL, &s, NULL);
+  if (st != EFI_BUFFER_TOO_SMALL || s == 0) return NULL;
+  void *d = NULL;
+  if (EFI_ERROR(BS->AllocatePool(EfiLoaderData, s, &d)) || !d) return NULL;
+  if (EFI_ERROR(RT->GetVariable(name, g, NULL, &s, d))) {
+    BS->FreePool(d);
+    return NULL;
+  }
+  *sz = s;
+  return d;
+}
 
 // ---------------------------------------------------------------------------
 // MSR read/write helpers
 // ---------------------------------------------------------------------------
-
-// Write a 64-bit value to a Model-Specific Register (MSR).
-// wrmsr takes: ECX=index, EDX:EAX=value (high:low 32-bit halves).
 static uint64_t AsmWriteMsr64(uint32_t index, uint64_t val) {
   uint32_t low = (uint32_t)(val);
   uint32_t high = (uint32_t)(val >> 32);
@@ -19,8 +117,6 @@ static uint64_t AsmWriteMsr64(uint32_t index, uint64_t val) {
   return val;
 }
 
-// Read a 64-bit Model-Specific Register (MSR).
-// rdmsr takes: ECX=index, returns EDX:EAX=value (high:low 32-bit halves).
 static uint64_t AsmReadMsr64(uint32_t index) {
   uint32_t low, high;
   __asm__ __volatile__("rdmsr" : "=a"(low), "=d"(high) : "c"(index) : "memory");
@@ -28,97 +124,30 @@ static uint64_t AsmReadMsr64(uint32_t index) {
 }
 
 // ---------------------------------------------------------------------------
-// Partial EFI_LOAD_OPTION structure for parsing boot variables.
-// ---------------------------------------------------------------------------
-
 typedef struct __attribute__((packed)) {
   UINT32 Attributes;
   UINT16 FilePathListLength;
 } EFI_LOAD_OPTION_HEADER;
 
-// ---------------------------------------------------------------------------
-// Hex / variable name helpers
-// ---------------------------------------------------------------------------
-
-// Convert a nibble (0-15) to its hex character representation.
-static CHAR16 HexDigit(UINTN val) {
-  if (val < 10) {
-    return (CHAR16)(L'0' + val);
-  }
-  return (CHAR16)(L'A' + (val - 10));
-}
-
-// Build a "Boot####" variable name from a boot option ID.
-// bootId is a 16-bit value; extract 4 hex digits (4 bits each).
-static void MakeBootVarName(UINT16 bootId, CHAR16 *name, UINTN nameLen) {
-  if (nameLen < 9) {
-    return;
-  }
+static void MakeBootVarName(UINT16 bootId, CHAR16 name[9]) {
+  const CHAR16 hex[] = L"0123456789ABCDEF";
   name[0] = L'B';
   name[1] = L'o';
   name[2] = L'o';
   name[3] = L't';
-  name[4] = HexDigit((bootId >> 12) & 0xF);  // Bits 15-12
-  name[5] = HexDigit((bootId >> 8) & 0xF);   // Bits 11-8
-  name[6] = HexDigit((bootId >> 4) & 0xF);   // Bits 7-4
-  name[7] = HexDigit(bootId & 0xF);          // Bits 3-0
+  name[4] = hex[(bootId >> 12) & 0xF];
+  name[5] = hex[(bootId >> 8) & 0xF];
+  name[6] = hex[(bootId >> 4) & 0xF];
+  name[7] = hex[bootId & 0xF];
   name[8] = L'\0';
 }
 
-// ---------------------------------------------------------------------------
-// EFI variable helpers
-// ---------------------------------------------------------------------------
-
-// Read an EFI variable, allocating a buffer for its contents.
-static EFI_STATUS GetVariableAlloc(EFI_SYSTEM_TABLE *systemTable, CHAR16 *name,
-                                   EFI_GUID *guid, UINT8 **data,
-                                   UINTN *dataSize) {
-  EFI_STATUS status;
-  UINTN size = 0;
-
-  status = uefi_call_wrapper(systemTable->RuntimeServices->GetVariable, 5, name,
-                             guid, NULL, &size, NULL);
-  if (status != EFI_BUFFER_TOO_SMALL) {
-    return status;
-  }
-
-  status = uefi_call_wrapper(systemTable->BootServices->AllocatePool, 3,
-                             EfiLoaderData, size, (void **)data);
-  if (EFI_ERROR(status)) {
-    return status;
-  }
-
-  status = uefi_call_wrapper(systemTable->RuntimeServices->GetVariable, 5, name,
-                             guid, NULL, &size, *data);
-  if (EFI_ERROR(status)) {
-    uefi_call_wrapper(systemTable->BootServices->FreePool, 1, *data);
-    *data = NULL;
-    return status;
-  }
-
-  *dataSize = size;
-  return EFI_SUCCESS;
-}
-
-// ---------------------------------------------------------------------------
-// Device path helpers (forward declarations)
-// ---------------------------------------------------------------------------
-
-static EFI_DEVICE_PATH_PROTOCOL *ParseBootOption(UINT8 *bootData,
-                                                  UINTN bootSize);
-static EFI_DEVICE_PATH_PROTOCOL *GetLoadedImagePath(
-    EFI_HANDLE image, EFI_SYSTEM_TABLE *systemTable);
+static EFI_DEVICE_PATH_PROTOCOL *ParseBootOption(UINT8 *bootData, UINTN bootSize);
+static EFI_DEVICE_PATH_PROTOCOL *GetLoadedImagePath(void);
 static BOOLEAN DevicePathsMatch(EFI_DEVICE_PATH_PROTOCOL *first,
                                 EFI_DEVICE_PATH_PROTOCOL *second);
 
-// ---------------------------------------------------------------------------
-// BootOrder walking
-// ---------------------------------------------------------------------------
-
-// Find the next loadable boot option ID after this image in the BootOrder list.
-static EFI_STATUS GetNextBootOption(EFI_HANDLE image,
-                                    EFI_SYSTEM_TABLE *systemTable,
-                                    UINTN startOffset, UINT16 *nextBootId,
+static EFI_STATUS GetNextBootOption(UINTN startOffset, UINT16 *nextBootId,
                                     UINTN *nextOffset) {
   EFI_STATUS status;
   UINT8 *bootOrderData = NULL;
@@ -131,21 +160,19 @@ static EFI_STATUS GetNextBootOption(EFI_HANDLE image,
   UINTN currentIndex = 0;
   EFI_DEVICE_PATH_PROTOCOL *loadedPath;
 
-  status = GetVariableAlloc(systemTable, L"BootOrder", &gEfiGlobalVariableGuid,
-                            &bootOrderData, &bootOrderSize);
-  if (EFI_ERROR(status)) {
-    return status;
-  }
+  bootOrderData =
+      LibGetVariableAndSize(L"BootOrder", &gEfiGlobalVariableGuid, &bootOrderSize);
+  if (!bootOrderData) return EFI_NOT_FOUND;
 
   if (bootOrderSize < sizeof(UINT16) || (bootOrderSize % sizeof(UINT16)) != 0) {
-    uefi_call_wrapper(systemTable->BootServices->FreePool, 1, bootOrderData);
+    FreePool(bootOrderData);
     return EFI_COMPROMISED_DATA;
   }
 
   bootOrder = (UINT16 *)bootOrderData;
   bootCount = bootOrderSize / sizeof(UINT16);
 
-  loadedPath = GetLoadedImagePath(image, systemTable);
+  loadedPath = GetLoadedImagePath();
   if (loadedPath) {
     for (i = 0; i < bootCount; ++i) {
       UINT16 bootId = bootOrder[i];
@@ -154,34 +181,26 @@ static EFI_STATUS GetNextBootOption(EFI_HANDLE image,
       UINTN bootSize = 0;
       EFI_DEVICE_PATH_PROTOCOL *devicePath;
 
-      MakeBootVarName(bootId, bootVarName,
-                      sizeof(bootVarName) / sizeof(CHAR16));
-      status = GetVariableAlloc(systemTable, bootVarName,
-                                &gEfiGlobalVariableGuid, &bootData, &bootSize);
-      if (EFI_ERROR(status)) {
-        continue;
-      }
+      MakeBootVarName(bootId, bootVarName);
+      bootData = LibGetVariableAndSize(bootVarName, &gEfiGlobalVariableGuid, &bootSize);
+      if (!bootData) continue;
 
       devicePath = ParseBootOption(bootData, bootSize);
       if (devicePath && DevicePathsMatch(devicePath, loadedPath)) {
         found = TRUE;
         currentIndex = i;
-        uefi_call_wrapper(systemTable->BootServices->FreePool, 1, bootData);
+        FreePool(bootData);
         break;
       }
-
-      uefi_call_wrapper(systemTable->BootServices->FreePool, 1, bootData);
+      FreePool(bootData);
     }
   }
 
   if (!found) {
     UINTN size = sizeof(bootCurrent);
-    status = uefi_call_wrapper(systemTable->RuntimeServices->GetVariable, 5,
-                               L"BootCurrent", &gEfiGlobalVariableGuid, NULL,
-                               &size, &bootCurrent);
-    if (EFI_ERROR(status)) {
-      bootCurrent = 0xFFFF;
-    }
+    status = RT->GetVariable(L"BootCurrent", &gEfiGlobalVariableGuid, NULL, &size,
+                             &bootCurrent);
+    if (EFI_ERROR(status)) bootCurrent = 0xFFFF;
     for (i = 0; i < bootCount; ++i) {
       if (bootOrder[i] == bootCurrent) {
         found = TRUE;
@@ -191,18 +210,8 @@ static EFI_STATUS GetNextBootOption(EFI_HANDLE image,
     }
   }
 
-  if (!found) {
-    uefi_call_wrapper(systemTable->BootServices->FreePool, 1, bootOrderData);
-    return EFI_NOT_FOUND;
-  }
-
-  if (bootCount == 1) {
-    uefi_call_wrapper(systemTable->BootServices->FreePool, 1, bootOrderData);
-    return EFI_NOT_FOUND;
-  }
-
-  if (startOffset >= bootCount) {
-    uefi_call_wrapper(systemTable->BootServices->FreePool, 1, bootOrderData);
+  if (!found || bootCount == 1 || startOffset >= bootCount) {
+    FreePool(bootOrderData);
     return EFI_NOT_FOUND;
   }
 
@@ -212,108 +221,80 @@ static EFI_STATUS GetNextBootOption(EFI_HANDLE image,
     UINT8 *bootData = NULL;
     UINTN bootSize = 0;
 
-    MakeBootVarName(bootId, bootVarName,
-                    sizeof(bootVarName) / sizeof(CHAR16));
-    status = GetVariableAlloc(systemTable, bootVarName, &gEfiGlobalVariableGuid,
-                              &bootData, &bootSize);
-    if (EFI_ERROR(status)) {
-      continue;
-    }
+    MakeBootVarName(bootId, bootVarName);
+    bootData = LibGetVariableAndSize(bootVarName, &gEfiGlobalVariableGuid, &bootSize);
+    if (!bootData) continue;
 
     if (ParseBootOption(bootData, bootSize)) {
       *nextBootId = bootId;
       *nextOffset = i;
-      uefi_call_wrapper(systemTable->BootServices->FreePool, 1, bootData);
-      uefi_call_wrapper(systemTable->BootServices->FreePool, 1, bootOrderData);
+      FreePool(bootData);
+      FreePool(bootOrderData);
       return EFI_SUCCESS;
     }
-
-    uefi_call_wrapper(systemTable->BootServices->FreePool, 1, bootData);
+    FreePool(bootData);
   }
 
-  uefi_call_wrapper(systemTable->BootServices->FreePool, 1, bootOrderData);
+  FreePool(bootOrderData);
   return EFI_NOT_FOUND;
 }
 
-static EFI_DEVICE_PATH_PROTOCOL *GetLoadedImagePath(
-    EFI_HANDLE image, EFI_SYSTEM_TABLE *systemTable) {
-  EFI_STATUS status;
+static EFI_DEVICE_PATH_PROTOCOL *GetLoadedImagePath(void) {
   EFI_DEVICE_PATH_PROTOCOL *devicePath = NULL;
   EFI_LOADED_IMAGE *loadedImage = NULL;
 
-  status = uefi_call_wrapper(systemTable->BootServices->OpenProtocol, 6, image,
-                             &gEfiLoadedImageDevicePathProtocolGuid,
-                             (void **)&devicePath, image, NULL,
-                             EFI_OPEN_PROTOCOL_GET_PROTOCOL);
-  if (!EFI_ERROR(status) && devicePath) {
+  if (!EFI_ERROR(BS->HandleProtocol(IM, &gEfiLoadedImageDevicePathProtocolGuid,
+                                    (void **)&devicePath)) &&
+      devicePath)
     return devicePath;
-  }
 
-  status = uefi_call_wrapper(systemTable->BootServices->OpenProtocol, 6, image,
-                             &gEfiLoadedImageProtocolGuid,
-                             (void **)&loadedImage, image, NULL,
-                             EFI_OPEN_PROTOCOL_GET_PROTOCOL);
-  if (!EFI_ERROR(status) && loadedImage) {
+  if (!EFI_ERROR(BS->HandleProtocol(IM, &gEfiLoadedImageProtocolGuid,
+                                    (void **)&loadedImage)) &&
+      loadedImage)
     return loadedImage->FilePath;
-  }
 
   return NULL;
 }
 
-static EFI_DEVICE_PATH_PROTOCOL *FindFilePathNode(
-    EFI_DEVICE_PATH_PROTOCOL *devicePath) {
-  EFI_DEVICE_PATH_PROTOCOL *node = devicePath;
-
+static EFI_DEVICE_PATH_PROTOCOL *FindFilePathNode(EFI_DEVICE_PATH_PROTOCOL *dp) {
+  EFI_DEVICE_PATH_PROTOCOL *node = dp;
   while (node && !IsDevicePathEnd(node)) {
     if (DevicePathType(node) == MEDIA_DEVICE_PATH &&
-        DevicePathSubType(node) == MEDIA_FILEPATH_DP) {
+        DevicePathSubType(node) == MEDIA_FILEPATH_DP)
       return node;
-    }
     node = NextDevicePathNode(node);
   }
-
   return NULL;
 }
 
-// Check if a device path contains a file path node (needed for LoadImage).
-static BOOLEAN DevicePathHasFilePath(EFI_DEVICE_PATH_PROTOCOL *devicePath) {
-  return FindFilePathNode(devicePath) != NULL;
+static BOOLEAN DevicePathHasFilePath(EFI_DEVICE_PATH_PROTOCOL *dp) {
+  return FindFilePathNode(dp) != NULL;
 }
 
 static BOOLEAN DevicePathsMatch(EFI_DEVICE_PATH_PROTOCOL *first,
                                 EFI_DEVICE_PATH_PROTOCOL *second) {
-  UINTN firstSize;
-  UINTN secondSize;
-  EFI_DEVICE_PATH_PROTOCOL *firstFile;
-  EFI_DEVICE_PATH_PROTOCOL *secondFile;
+  UINTN firstSize, secondSize;
+  EFI_DEVICE_PATH_PROTOCOL *firstFile, *secondFile;
 
-  if (!first || !second) {
-    return FALSE;
-  }
+  if (!first || !second) return FALSE;
 
   firstSize = DevicePathSize(first);
   secondSize = DevicePathSize(second);
-  if (firstSize == secondSize && CompareMem(first, second, firstSize) == 0) {
+  if (firstSize && firstSize == secondSize &&
+      CompareMem(first, second, firstSize) == 0)
     return TRUE;
-  }
 
   firstFile = FindFilePathNode(first);
   secondFile = FindFilePathNode(second);
-  if (!firstFile || !secondFile) {
-    return FALSE;
-  }
+  if (!firstFile || !secondFile) return FALSE;
 
-  firstSize = DevicePathNodeLength(firstFile);
-  secondSize = DevicePathNodeLength(secondFile);
+  firstSize = (UINTN)DevicePathNodeLength(firstFile);
+  secondSize = (UINTN)DevicePathNodeLength(secondFile);
   return firstSize == secondSize &&
          CompareMem(firstFile, secondFile, firstSize) == 0;
 }
 
-// Parse a Boot#### variable and extract the device path.
-// EFI_LOAD_OPTION layout: [Attributes][FilePathListLength][Description\0][FilePath...]
-// Returns NULL if parsing fails or the path has no file component.
-static EFI_DEVICE_PATH_PROTOCOL *ParseBootOption(UINT8 *bootData,
-                                                  UINTN bootSize) {
+static EFI_DEVICE_PATH_PROTOCOL *ParseBootOption(UINT8 *bootData, UINTN bootSize) {
   EFI_LOAD_OPTION_HEADER *header;
   UINT8 *descPtr;
   CHAR16 *description;
@@ -321,53 +302,31 @@ static EFI_DEVICE_PATH_PROTOCOL *ParseBootOption(UINT8 *bootData,
   UINT8 *filePath;
   EFI_DEVICE_PATH_PROTOCOL *devicePath;
 
-  if (bootSize < sizeof(EFI_LOAD_OPTION_HEADER) + sizeof(CHAR16)) {
-    return NULL;
-  }
+  if (bootSize < sizeof(EFI_LOAD_OPTION_HEADER) + sizeof(CHAR16)) return NULL;
 
   header = (EFI_LOAD_OPTION_HEADER *)bootData;
-  if ((header->Attributes & LOAD_OPTION_ACTIVE) == 0) {
-    return NULL;
-  }
+  if ((header->Attributes & LOAD_OPTION_ACTIVE) == 0) return NULL;
 
   descPtr = bootData + sizeof(EFI_LOAD_OPTION_HEADER);
   description = (CHAR16 *)descPtr;
 
-  // Find null terminator in description string.
   descMax = (bootSize - (UINTN)(descPtr - bootData)) / sizeof(CHAR16);
-  for (descLen = 0; descLen < descMax; ++descLen) {
-    if (description[descLen] == L'\0') {
-      break;
-    }
-  }
-  if (descLen == descMax) {
-    return NULL;  // No null terminator
-  }
+  for (descLen = 0; descLen < descMax; ++descLen)
+    if (description[descLen] == L'\0') break;
+  if (descLen == descMax) return NULL;
 
-  // FilePath starts after the null-terminated description.
   filePath = (UINT8 *)(description + descLen + 1);
   if ((UINTN)(filePath - bootData) + header->FilePathListLength > bootSize ||
-      header->FilePathListLength == 0) {
+      header->FilePathListLength == 0)
     return NULL;
-  }
 
   devicePath = (EFI_DEVICE_PATH_PROTOCOL *)filePath;
-  if (!DevicePathHasFilePath(devicePath)) {
-    return NULL;  // Device-only path, can't chainload
-  }
+  if (!DevicePathHasFilePath(devicePath)) return NULL;
 
   return devicePath;
 }
 
-// ---------------------------------------------------------------------------
-// Chainload logic
-// ---------------------------------------------------------------------------
-
-// Chainload the next entry in BootOrder.
-// Returns EFI_SUCCESS if chainload succeeded (and started image returned).
-static EFI_STATUS TryBootOrderChainload(EFI_HANDLE image,
-                                        EFI_SYSTEM_TABLE *systemTable,
-                                        SIMPLE_TEXT_OUTPUT_INTERFACE *conOut) {
+static EFI_STATUS TryBootOrderChainload(void) {
   EFI_STATUS status;
   UINT16 nextBootId;
   UINTN offset = 1;
@@ -379,99 +338,56 @@ static EFI_STATUS TryBootOrderChainload(EFI_HANDLE image,
   EFI_HANDLE nextImage;
 
   for (;;) {
-    status = GetNextBootOption(image, systemTable, offset, &nextBootId,
-                               &nextOffset);
+    status = GetNextBootOption(offset, &nextBootId, &nextOffset);
     if (status == EFI_NOT_FOUND) {
-      conOut->OutputString(conOut, L"No next boot entry\r\n");
+      Output(L"No next boot entry\r\n");
       return status;
     }
     if (EFI_ERROR(status)) {
-      conOut->OutputString(conOut, L"BootOrder unavailable\r\n");
+      Output(L"BootOrder unavailable\r\n");
       return status;
     }
     offset = nextOffset + 1;
 
-    // Read the Boot#### variable.
-    MakeBootVarName(nextBootId, bootVarName,
-                    sizeof(bootVarName) / sizeof(CHAR16));
-    status = GetVariableAlloc(systemTable, bootVarName, &gEfiGlobalVariableGuid,
-                              &bootData, &bootSize);
-    if (EFI_ERROR(status)) {
-      continue;
-    }
+    MakeBootVarName(nextBootId, bootVarName);
+    bootData = LibGetVariableAndSize(bootVarName, &gEfiGlobalVariableGuid, &bootSize);
+    if (!bootData) continue;
 
     devicePath = ParseBootOption(bootData, bootSize);
     if (!devicePath) {
-      uefi_call_wrapper(systemTable->BootServices->FreePool, 1, bootData);
+      FreePool(bootData);
       continue;
     }
 
-    conOut->OutputString(conOut, L"Chainloading next boot entry\r\n");
-    status = uefi_call_wrapper(systemTable->BootServices->LoadImage, 6, FALSE,
-                               image, devicePath, NULL, 0, &nextImage);
-    uefi_call_wrapper(systemTable->BootServices->FreePool, 1, bootData);
+    Output(L"Chainloading next boot entry\r\n");
+    // Expand the short-form boot path to a full path off our own partition;
+    // fall back to the raw path if that fails (e.g. firmware that expands it).
+    EFI_DEVICE_PATH_PROTOCOL *full = BuildFullPath(devicePath);
+    status = BS->LoadImage(FALSE, IM, full ? full : devicePath, NULL, 0, &nextImage);
+    if (full) FreePool(full);
+    FreePool(bootData);
     bootData = NULL;
-    if (EFI_ERROR(status)) {
-      continue;
-    }
+    if (EFI_ERROR(status)) continue;
 
-    status = uefi_call_wrapper(systemTable->BootServices->StartImage, 3,
-                               nextImage, NULL, NULL);
-    if (EFI_ERROR(status)) {
-      continue;
-    }
+    status = BS->StartImage(nextImage, NULL, NULL);
+    if (EFI_ERROR(status)) continue;
 
     return status;
   }
 }
 
-// Chainload to the next boot entry.
-static EFI_STATUS ChainloadNext(EFI_HANDLE image, EFI_SYSTEM_TABLE *systemTable,
-                                SIMPLE_TEXT_OUTPUT_INTERFACE *conOut) {
-  return TryBootOrderChainload(image, systemTable, conOut);
-}
+EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *systemTable) {
+  ST = systemTable;
+  BS = systemTable->BootServices;
+  RT = systemTable->RuntimeServices;
+  IM = image;
 
-// ---------------------------------------------------------------------------
-// Main entry point
-// ---------------------------------------------------------------------------
-
-// Main entry point: attempt MSR write with #GP fault-tolerance, then chainload.
-static EFI_STATUS efi_main_sysv(EFI_HANDLE image,
-                                EFI_SYSTEM_TABLE *systemTable) {
-  SIMPLE_TEXT_OUTPUT_INTERFACE *conOut;
-
-  InitializeLib(image, systemTable);
-  conOut = systemTable->ConOut;
-
-  // MSR 0x1FC = IA32_POWER_CTL. Read-modify-write so we only touch the two
-  // bits we care about and preserve every other firmware-set bit (e.g. bit1
-  // C1E enable):
-  //   bit0  = 0 -> BD PROCHOT disabled (clears bi-directional processor hot
-  //                throttling).
-  //   bit24 = 1 -> DISABLE_VR_THERMAL_ALERT: lifts a phantom VR-thermal clamp
-  //                that pinned CPU+iGPU to base clock even when thermals were
-  //                fine.  Confirmed in SiInit.efi; verified live on this laptop
-  //                (cores 1800->2500+, iGPU 300->1150 MHz).
-  // This MSR never #GPs on real hardware; QEMU/OVMF silently emulates it. So no
-  // hypervisor check or fault handler is needed — just do the write.
-  conOut->OutputString(conOut, L"Disabling BD PROCHOT + VR Thermal Alert\r\n");
+  Output(L"Disabling BD PROCHOT + VR Thermal Alert\r\n");
   uint64_t powerCtl = AsmReadMsr64(0x1FC);
-  powerCtl &= ~(uint64_t)0x1;       // clear bit0  (BD PROCHOT)
-  powerCtl |= (uint64_t)0x1 << 24;  // set  bit24  (disable VR thermal alert)
+  powerCtl &= ~(uint64_t)0x1;
+  powerCtl |= (uint64_t)0x1 << 24;
   AsmWriteMsr64(0x1FC, powerCtl);
-  conOut->OutputString(conOut, L"BD PROCHOT + VR Thermal Alert disabled\r\n");
+  Output(L"BD PROCHOT + VR Thermal Alert disabled\r\n");
 
-  return ChainloadNext(image, systemTable, conOut);
-}
-
-// GNU-EFI entry point (System V ABI).
-EFI_STATUS
-_entry(EFI_HANDLE image, EFI_SYSTEM_TABLE *systemTable) {
-  return efi_main_sysv(image, systemTable);
-}
-
-// Standard EFI entry point (MS ABI).
-EFI_STATUS __attribute__((ms_abi)) efi_main(EFI_HANDLE image,
-                                            EFI_SYSTEM_TABLE *systemTable) {
-  return efi_main_sysv(image, systemTable);
+  return TryBootOrderChainload();
 }

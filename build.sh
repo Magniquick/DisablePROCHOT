@@ -1,44 +1,43 @@
 #!/bin/bash
+set -euo pipefail
 
-build_efi() {
-	local name="$1"
-	local src="$2"
-	local libs="$3"
-	local dest="$4"
+# -----------------------------------------------------------------------------
+# Everything is built natively to PE-COFF with clang + lld -- no GNU-EFI
+# runtime, no objcopy ELF->PE conversion. UEFI binaries are just PE32+ with the
+# MS x64 ABI, which clang's x86_64-unknown-windows target emits directly.
+# GNU-EFI headers are used for TYPES only; all runtime helpers live in the .c.
+#
+#   -mno-sse -mgeneral-regs-only : no SSE/AVX/x87/MMX may be emitted (firmware
+#                                  has no guaranteed FP/vector state)
+#   -mno-red-zone                : mandatory in firmware context
+#   -Os -flto + /opt:ref,icf     : dead-code elimination -> a few KB
+# Default page alignment keeps W^X and broad firmware compatibility.
+# -----------------------------------------------------------------------------
+CLANG=(
+	clang --target=x86_64-unknown-windows
+	# GNU-EFI headers as -isystem so their warnings stay out of our build
+	# (transparent to clang) while our own code is fully checked.
+	-isystem /usr/include/efi -isystem /usr/include/efi/x86_64
+	-DHAVE_USE_MS_ABI -Dx86_64
+	-std=c17 -ffreestanding -fshort-wchar -mno-red-zone -fno-stack-protector
+	-mno-sse -mgeneral-regs-only -fno-builtin
+	-fno-unwind-tables -fno-asynchronous-unwind-tables
+	-Os -ffunction-sections -fdata-sections -flto
+	-Wall -Wextra -Wpedantic -Wundef -Wshadow -Wpointer-arith -Wdouble-promotion -Wconversion
+	-Werror -Wno-error=pedantic  # pedantic informs but never fails the build
+	-nostdlib -fuse-ld=lld
+	-Wl,-subsystem:efi_application -Wl,-entry:efi_main -Wl,/opt:ref -Wl,/opt:icf
+)
 
-	# drop -O3 to debug
-	gcc -I/usr/include/efi -I/usr/include/efi/x86_64 \
-		-DHAVE_USE_MS_ABI -Dx86_64 \
-		-fPIC -fshort-wchar -ffreestanding -fno-stack-protector -maccumulate-outgoing-args \
-		-Wall -Werror \
-		-m64 -mno-red-zone -O3 \
-		-c -o "${name}.o" "$src"
-
-	ld -T /usr/lib/elf_x86_64_efi.lds -Bsymbolic -shared -nostdlib -znocombreloc \
-		/usr/lib/crt0-efi-x86_64.o \
-		-o "${name}.so" "${name}.o" \
-		$(gcc -print-libgcc-file-name) $libs
-
-	objcopy -j .text -j .sdata -j .rodata -j .data -j .dynamic -j .dynsym -j .rel \
-		-j .rela -j .reloc -S -O pei-x86-64 --subsystem=efi-app \
-		--stack 0x20000,0x20000 \
-		"${name}.so" "${name}.efi"
-
-	rm "${name}.o" "${name}.so"
-
-	if [ -n "$dest" ]; then
-		mv "${name}.efi" "$dest"
-		echo "Built ${dest}"
-		ls -l "$dest"
-		md5sum "$dest"
-	else
-		echo "Built ${name}.efi"
-		ls -l "${name}.efi"
-		md5sum "${name}.efi"
-	fi
+build() { # <out.efi> <src.c>
+	"${CLANG[@]}" -o "$1" "$2"
+	echo "Built $1 ($(stat -c%s "$1") bytes)"
 }
 
-build_efi "DisablePROCHOT" "DisablePROCHOT.c" "/usr/lib/libgnuefi.a /usr/lib/libefi.a"
-build_efi "ChainSuccess" "test/ChainSuccess.c" "/usr/lib/libgnuefi.a" "./test/ChainSuccess.efi"
-build_efi "WrongTarget" "test/WrongTarget.c" "/usr/lib/libgnuefi.a" "./test/WrongTarget.efi"
-build_efi "SetBootOrder" "test/SetBootOrder.c" "/usr/lib/libgnuefi.a /usr/lib/libefi.a" "./test/SetBootOrder.efi"
+build DisablePROCHOT.efi      DisablePROCHOT.c
+md5sum DisablePROCHOT.efi
+
+# Test-harness helpers (only needed for ./test/run.sh).
+build test/ChainSuccess.efi   test/ChainSuccess.c
+build test/WrongTarget.efi    test/WrongTarget.c
+build test/SetBootOrder.efi   test/SetBootOrder.c

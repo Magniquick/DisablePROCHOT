@@ -1,228 +1,200 @@
-// Test helper: Set up BootOrder with DisablePROCHOT -> ChainSuccess,
-// then launch DisablePROCHOT to test the BootOrder chainload path.
+// Test helper: set up BootOrder with DisablePROCHOT -> ChainSuccess (plus a
+// few decoy entries), then launch DisablePROCHOT to exercise the chainload.
+//
+// Self-contained: GNU-EFI headers for TYPES only, no GNU-EFI lib, so it builds
+// straight to PE-COFF with clang/lld like the main app.
 
 #include <efi.h>
-#include <efilib.h>
 
-// EFI_LOAD_OPTION structure for boot variables.
-// Layout: [Attributes][FilePathListLength][Description\0][FilePath...]
-static EFI_STATUS CreateBootOption(EFI_SYSTEM_TABLE *systemTable,
-                                   UINT16 bootId,
-                                   CHAR16 *description,
-                                   CHAR16 *filePath,
-                                   EFI_HANDLE deviceHandle) {
+static EFI_SYSTEM_TABLE *ST;
+static EFI_BOOT_SERVICES *BS;
+static EFI_RUNTIME_SERVICES *RT;
+static EFI_HANDLE IM;
+
+static EFI_GUID gEfiGlobalVariableGuid = EFI_GLOBAL_VARIABLE;
+static EFI_GUID gEfiLoadedImageProtocolGuid = LOADED_IMAGE_PROTOCOL;
+static EFI_GUID gEfiDevicePathProtocolGuid = {
+    0x09576e91, 0x6d3f, 0x11d2, {0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b}};
+
+static void Out(CHAR16 *s) { ST->ConOut->OutputString(ST->ConOut, s); }
+
+static UINTN StrLen16(CHAR16 *s) {
+  UINTN n = 0;
+  while (s[n]) n++;
+  return n;
+}
+
+static void CopyMem8(void *d, const void *s, UINTN n) {
+  UINT8 *dd = d;
+  const UINT8 *ss = s;
+  for (UINTN i = 0; i < n; i++) dd[i] = ss[i];
+}
+
+static UINTN DevPathSize(EFI_DEVICE_PATH_PROTOCOL *dp) {
+  EFI_DEVICE_PATH_PROTOCOL *n = dp;
+  UINTN sz = 0;
+  while (n) {
+    UINTN l = (UINTN)DevicePathNodeLength(n);
+    if (l < sizeof(EFI_DEVICE_PATH_PROTOCOL)) return 0;
+    sz += l;
+    if (IsDevicePathEnd(n)) return sz;
+    n = NextDevicePathNode(n);
+  }
+  return 0;
+}
+
+// Build  <partition device path> + File(file) + End  for a handle's volume.
+static EFI_DEVICE_PATH_PROTOCOL *FileDevicePath16(EFI_HANDLE dev, CHAR16 *file) {
+  EFI_DEVICE_PATH_PROTOCOL *dp = NULL;
+  UINT8 *out;
+  UINTN dlen, fbytes, fnode;
+
+  if (EFI_ERROR(BS->HandleProtocol(dev, &gEfiDevicePathProtocolGuid, (void **)&dp)) || !dp)
+    return NULL;
+  dlen = DevPathSize(dp);
+  if (dlen < 4) return NULL;
+  dlen -= 4;  // strip End
+  fbytes = (StrLen16(file) + 1) * sizeof(CHAR16);
+  fnode = 4 + fbytes;  // File node header (4) + path string
+
+  if (EFI_ERROR(BS->AllocatePool(EfiLoaderData, dlen + fnode + 4, (void **)&out)) || !out)
+    return NULL;
+  CopyMem8(out, dp, dlen);
+  out[dlen + 0] = 0x04;  // MEDIA_DEVICE_PATH
+  out[dlen + 1] = 0x04;  // MEDIA_FILEPATH_DP
+  out[dlen + 2] = (UINT8)(fnode & 0xff);
+  out[dlen + 3] = (UINT8)(fnode >> 8);
+  CopyMem8(out + dlen + 4, file, fbytes);
+  out[dlen + fnode + 0] = 0x7f;  // End-of-device-path
+  out[dlen + fnode + 1] = 0xff;
+  out[dlen + fnode + 2] = 0x04;
+  out[dlen + fnode + 3] = 0x00;
+  return (EFI_DEVICE_PATH_PROTOCOL *)out;
+}
+
+static EFI_STATUS CreateBootOption(UINT16 bootId, CHAR16 *description,
+                                   CHAR16 *filePath, EFI_HANDLE deviceHandle) {
   EFI_STATUS status;
   UINT8 endDevicePath[] = {0x7f, 0xff, 0x04, 0x00};
   EFI_DEVICE_PATH_PROTOCOL *devicePath;
-  UINTN devicePathSize;
-  UINTN descSize;
-  UINTN totalSize;
-  UINT8 *buffer;
-  UINT8 *ptr;
+  UINTN devicePathSize, descSize, totalSize;
+  UINT8 *buffer, *ptr;
   CHAR16 varName[9];
+  const CHAR16 hex[] = L"0123456789ABCDEF";
 
   if (filePath) {
-    devicePath = FileDevicePath(deviceHandle, filePath);
-    if (!devicePath) {
-      return EFI_OUT_OF_RESOURCES;
-    }
-    devicePathSize = DevicePathSize(devicePath);
+    devicePath = FileDevicePath16(deviceHandle, filePath);
+    if (!devicePath) return EFI_OUT_OF_RESOURCES;
+    devicePathSize = DevPathSize(devicePath);
   } else {
     devicePath = (EFI_DEVICE_PATH_PROTOCOL *)endDevicePath;
     devicePathSize = sizeof(endDevicePath);
   }
 
-  // Calculate sizes.
-  descSize = (StrLen(description) + 1) * sizeof(CHAR16);
+  descSize = (StrLen16(description) + 1) * sizeof(CHAR16);
   totalSize = sizeof(UINT32) + sizeof(UINT16) + descSize + devicePathSize;
 
-  // Allocate buffer.
-  status = uefi_call_wrapper(systemTable->BootServices->AllocatePool, 3,
-                             EfiLoaderData, totalSize, (void **)&buffer);
-  if (EFI_ERROR(status)) {
-    return status;
-  }
+  if (EFI_ERROR(BS->AllocatePool(EfiLoaderData, totalSize, (void **)&buffer)))
+    return EFI_OUT_OF_RESOURCES;
 
-  // Build EFI_LOAD_OPTION.
   ptr = buffer;
-
-  // Attributes (LOAD_OPTION_ACTIVE = 0x00000001)
-  *(UINT32 *)ptr = bootId == 0x0005 ? 0 : 0x00000001;
+  *(UINT32 *)ptr = bootId == 0x0005 ? 0 : 0x00000001;  // LOAD_OPTION_ACTIVE
   ptr += sizeof(UINT32);
-
-  // FilePathListLength
   *(UINT16 *)ptr = (UINT16)devicePathSize;
   ptr += sizeof(UINT16);
-
-  // Description (null-terminated UTF-16)
-  CopyMem(ptr, description, descSize);
+  CopyMem8(ptr, description, descSize);
   ptr += descSize;
+  CopyMem8(ptr, devicePath, devicePathSize);
 
-  // FilePath (device path)
-  CopyMem(ptr, devicePath, devicePathSize);
-
-  // Build variable name "Boot####"
   varName[0] = L'B';
   varName[1] = L'o';
   varName[2] = L'o';
   varName[3] = L't';
-  varName[4] = (bootId >> 12) < 10 ? L'0' + (bootId >> 12) : L'A' + (bootId >> 12) - 10;
-  varName[5] = ((bootId >> 8) & 0xF) < 10 ? L'0' + ((bootId >> 8) & 0xF) : L'A' + ((bootId >> 8) & 0xF) - 10;
-  varName[6] = ((bootId >> 4) & 0xF) < 10 ? L'0' + ((bootId >> 4) & 0xF) : L'A' + ((bootId >> 4) & 0xF) - 10;
-  varName[7] = (bootId & 0xF) < 10 ? L'0' + (bootId & 0xF) : L'A' + (bootId & 0xF) - 10;
+  varName[4] = hex[(bootId >> 12) & 0xF];
+  varName[5] = hex[(bootId >> 8) & 0xF];
+  varName[6] = hex[(bootId >> 4) & 0xF];
+  varName[7] = hex[bootId & 0xF];
   varName[8] = L'\0';
 
-  // Write the boot variable.
-  status = uefi_call_wrapper(systemTable->RuntimeServices->SetVariable, 5,
-                             varName, &gEfiGlobalVariableGuid,
-                             EFI_VARIABLE_NON_VOLATILE |
-                             EFI_VARIABLE_BOOTSERVICE_ACCESS |
-                             EFI_VARIABLE_RUNTIME_ACCESS,
-                             totalSize, buffer);
-
-  uefi_call_wrapper(systemTable->BootServices->FreePool, 1, buffer);
+  status = RT->SetVariable(varName, &gEfiGlobalVariableGuid,
+                           EFI_VARIABLE_NON_VOLATILE |
+                               EFI_VARIABLE_BOOTSERVICE_ACCESS |
+                               EFI_VARIABLE_RUNTIME_ACCESS,
+                           totalSize, buffer);
+  BS->FreePool(buffer);
   return status;
 }
 
-static EFI_STATUS efi_main_impl(EFI_HANDLE image, EFI_SYSTEM_TABLE *systemTable) {
+EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *systemTable) {
   EFI_STATUS status;
   EFI_LOADED_IMAGE *loadedImage = NULL;
-  EFI_HANDLE deviceHandle;
-  SIMPLE_TEXT_OUTPUT_INTERFACE *conOut = systemTable->ConOut;
-  // Boot0002 is what firmware sets BootCurrent to when booting BOOTX64.EFI.
-  // We overwrite Boot0002 to point to DisablePROCHOT, Boot0006 to a stale
-  // active file entry, Boot0005 to an inactive file entry, Boot0004 to a
-  // device-only placeholder, Boot0003 to ChainSuccess, Boot0000 to a stale
-  // BootCurrent value, and Boot0001 to a wrong target.
-  UINT16 bootOrder[7] = {0x0002, 0x0006, 0x0005, 0x0004,
-                         0x0003, 0x0000, 0x0001};
-  UINT16 staleBootCurrent = 0x0000;
+  EFI_HANDLE deviceHandle, disableImage;
   EFI_DEVICE_PATH_PROTOCOL *disablePath;
-  EFI_HANDLE disableImage;
+  UINT16 bootOrder[7] = {0x0002, 0x0006, 0x0005, 0x0004, 0x0003, 0x0000, 0x0001};
+  UINT16 staleBootCurrent = 0x0000;
 
-  InitializeLib(image, systemTable);
+  ST = systemTable;
+  BS = systemTable->BootServices;
+  RT = systemTable->RuntimeServices;
+  IM = image;
+  (void)IM;
 
-  conOut->OutputString(conOut, L"SetBootOrder: Setting up boot variables\r\n");
+  Out(L"SetBootOrder: Setting up boot variables\r\n");
 
-  // Get our device handle.
-  status = uefi_call_wrapper(systemTable->BootServices->OpenProtocol, 6, image,
-                             &gEfiLoadedImageProtocolGuid, (void **)&loadedImage,
-                             image, NULL, EFI_OPEN_PROTOCOL_GET_PROTOCOL);
-  if (EFI_ERROR(status)) {
-    conOut->OutputString(conOut, L"Failed to get LoadedImage\r\n");
-    return status;
+  if (EFI_ERROR(BS->HandleProtocol(image, &gEfiLoadedImageProtocolGuid,
+                                   (void **)&loadedImage)) ||
+      !loadedImage) {
+    Out(L"Failed to get LoadedImage\r\n");
+    return EFI_LOAD_ERROR;
   }
   deviceHandle = loadedImage->DeviceHandle;
 
-  // Create Boot0002 -> DisablePROCHOT.efi (overwrites firmware's entry)
-  status = CreateBootOption(systemTable, 0x0002, L"DisablePROCHOT",
-                            L"\\EFI\\BOOT\\DisablePROCHOT.efi", deviceHandle);
+  if (EFI_ERROR(CreateBootOption(0x0002, L"DisablePROCHOT",
+                                 L"\\EFI\\BOOT\\DisablePROCHOT.efi", deviceHandle))) {
+    Out(L"Failed to create Boot0002\r\n");
+    return EFI_LOAD_ERROR;
+  }
+  Out(L"Created Boot0002 -> DisablePROCHOT.efi\r\n");
+
+  CreateBootOption(0x0000, L"StaleCurrent", L"\\EFI\\BOOT\\Missing.efi", deviceHandle);
+  Out(L"Created Boot0000 -> StaleCurrent\r\n");
+  CreateBootOption(0x0001, L"WrongTarget", L"\\EFI\\BOOT\\WrongTarget.efi", deviceHandle);
+  Out(L"Created Boot0001 -> WrongTarget.efi\r\n");
+  CreateBootOption(0x0004, L"EFI USB Device", NULL, deviceHandle);
+  Out(L"Created Boot0004 -> EFI USB Device\r\n");
+  CreateBootOption(0x0005, L"Inactive", L"\\EFI\\BOOT\\Inactive.efi", deviceHandle);
+  Out(L"Created Boot0005 -> Inactive\r\n");
+  CreateBootOption(0x0006, L"Missing", L"\\EFI\\BOOT\\Missing.efi", deviceHandle);
+  Out(L"Created Boot0006 -> Missing\r\n");
+  CreateBootOption(0x0003, L"ChainSuccess", L"\\EFI\\BOOT\\ChainSuccess.efi", deviceHandle);
+  Out(L"Created Boot0003 -> ChainSuccess.efi\r\n");
+
+  status = RT->SetVariable(L"BootOrder", &gEfiGlobalVariableGuid,
+                           EFI_VARIABLE_NON_VOLATILE |
+                               EFI_VARIABLE_BOOTSERVICE_ACCESS |
+                               EFI_VARIABLE_RUNTIME_ACCESS,
+                           sizeof(bootOrder), bootOrder);
   if (EFI_ERROR(status)) {
-    conOut->OutputString(conOut, L"Failed to create Boot0002\r\n");
+    Out(L"Failed to set BootOrder\r\n");
     return status;
   }
-  conOut->OutputString(conOut, L"Created Boot0002 -> DisablePROCHOT.efi\r\n");
+  Out(L"Set BootOrder = {0002, 0006, 0005, 0004, 0003, 0000, 0001}\r\n");
 
-  status = CreateBootOption(systemTable, 0x0000, L"StaleCurrent",
-                            L"\\EFI\\BOOT\\Missing.efi", deviceHandle);
-  if (EFI_ERROR(status)) {
-    conOut->OutputString(conOut, L"Failed to create Boot0000\r\n");
-    return status;
-  }
-  conOut->OutputString(conOut, L"Created Boot0000 -> StaleCurrent\r\n");
+  RT->SetVariable(L"BootCurrent", &gEfiGlobalVariableGuid,
+                  EFI_VARIABLE_BOOTSERVICE_ACCESS | EFI_VARIABLE_RUNTIME_ACCESS,
+                  sizeof(staleBootCurrent), &staleBootCurrent);
+  Out(L"BootCurrent = 0000 (stale test value)\r\n");
 
-  status = CreateBootOption(systemTable, 0x0001, L"WrongTarget",
-                            L"\\EFI\\BOOT\\WrongTarget.efi", deviceHandle);
-  if (EFI_ERROR(status)) {
-    conOut->OutputString(conOut, L"Failed to create Boot0001\r\n");
-    return status;
-  }
-  conOut->OutputString(conOut, L"Created Boot0001 -> WrongTarget.efi\r\n");
-
-  status = CreateBootOption(systemTable, 0x0004, L"EFI USB Device", NULL,
-                            deviceHandle);
-  if (EFI_ERROR(status)) {
-    conOut->OutputString(conOut, L"Failed to create Boot0004\r\n");
-    return status;
-  }
-  conOut->OutputString(conOut, L"Created Boot0004 -> EFI USB Device\r\n");
-
-  status = CreateBootOption(systemTable, 0x0005, L"Inactive",
-                            L"\\EFI\\BOOT\\Inactive.efi", deviceHandle);
-  if (EFI_ERROR(status)) {
-    conOut->OutputString(conOut, L"Failed to create Boot0005\r\n");
-    return status;
-  }
-  conOut->OutputString(conOut, L"Created Boot0005 -> Inactive\r\n");
-
-  status = CreateBootOption(systemTable, 0x0006, L"Missing",
-                            L"\\EFI\\BOOT\\Missing.efi", deviceHandle);
-  if (EFI_ERROR(status)) {
-    conOut->OutputString(conOut, L"Failed to create Boot0006\r\n");
-    return status;
-  }
-  conOut->OutputString(conOut, L"Created Boot0006 -> Missing\r\n");
-
-  // Create Boot0003 -> ChainSuccess.efi
-  status = CreateBootOption(systemTable, 0x0003, L"ChainSuccess",
-                            L"\\EFI\\BOOT\\ChainSuccess.efi", deviceHandle);
-  if (EFI_ERROR(status)) {
-    conOut->OutputString(conOut, L"Failed to create Boot0003\r\n");
-    return status;
-  }
-  conOut->OutputString(conOut, L"Created Boot0003 -> ChainSuccess.efi\r\n");
-
-  // Set BootOrder = {0002, 0006, 0005, 0004, 0003, 0000, 0001}
-  status = uefi_call_wrapper(systemTable->RuntimeServices->SetVariable, 5,
-                             L"BootOrder", &gEfiGlobalVariableGuid,
-                             EFI_VARIABLE_NON_VOLATILE |
-                             EFI_VARIABLE_BOOTSERVICE_ACCESS |
-                             EFI_VARIABLE_RUNTIME_ACCESS,
-                             sizeof(bootOrder), bootOrder);
-  if (EFI_ERROR(status)) {
-    conOut->OutputString(conOut, L"Failed to set BootOrder\r\n");
-    return status;
-  }
-  conOut->OutputString(conOut,
-                       L"Set BootOrder = {0002, 0006, 0005, 0004, 0003, 0000, 0001}\r\n");
-
-  status = uefi_call_wrapper(systemTable->RuntimeServices->SetVariable, 5,
-                             L"BootCurrent", &gEfiGlobalVariableGuid,
-                             EFI_VARIABLE_BOOTSERVICE_ACCESS |
-                             EFI_VARIABLE_RUNTIME_ACCESS,
-                             sizeof(staleBootCurrent), &staleBootCurrent);
-  if (EFI_ERROR(status)) {
-    conOut->OutputString(conOut, L"Failed to set stale BootCurrent\r\n");
-    return status;
-  }
-  conOut->OutputString(conOut, L"BootCurrent = 0000 (stale test value)\r\n");
-
-  // Now load and start DisablePROCHOT.efi
-  conOut->OutputString(conOut, L"Launching DisablePROCHOT.efi...\r\n");
-
-  disablePath = FileDevicePath(deviceHandle, L"\\EFI\\BOOT\\DisablePROCHOT.efi");
+  Out(L"Launching DisablePROCHOT.efi...\r\n");
+  disablePath = FileDevicePath16(deviceHandle, L"\\EFI\\BOOT\\DisablePROCHOT.efi");
   if (!disablePath) {
-    conOut->OutputString(conOut, L"Failed to create device path\r\n");
+    Out(L"Failed to create device path\r\n");
     return EFI_OUT_OF_RESOURCES;
   }
-
-  status = uefi_call_wrapper(systemTable->BootServices->LoadImage, 6,
-                             FALSE, image, disablePath, NULL, 0, &disableImage);
+  status = BS->LoadImage(FALSE, image, disablePath, NULL, 0, &disableImage);
   if (EFI_ERROR(status)) {
-    conOut->OutputString(conOut, L"Failed to load DisablePROCHOT.efi\r\n");
+    Out(L"Failed to load DisablePROCHOT.efi\r\n");
     return status;
   }
-
-  status = uefi_call_wrapper(systemTable->BootServices->StartImage, 3,
-                             disableImage, NULL, NULL);
-  return status;
-}
-
-EFI_STATUS _entry(EFI_HANDLE image, EFI_SYSTEM_TABLE *systemTable) {
-  return efi_main_impl(image, systemTable);
-}
-
-EFI_STATUS __attribute__((ms_abi)) efi_main(EFI_HANDLE image,
-                                            EFI_SYSTEM_TABLE *systemTable) {
-  return efi_main_impl(image, systemTable);
+  return BS->StartImage(disableImage, NULL, NULL);
 }

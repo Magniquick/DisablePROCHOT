@@ -13,7 +13,7 @@ jobs:
 
       - name: Install dependencies
         working-directory: ${{ github.workspace }}
-        run: sudo apt-get update && sudo apt-get install -y gnu-efi binutils
+        run: sudo apt-get update && sudo apt-get install -y clang lld gnu-efi
 
       - name: Build EFI binaries
         working-directory: ${{ github.workspace }}

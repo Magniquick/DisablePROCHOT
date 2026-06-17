@@ -2,31 +2,32 @@
 
 [Build workflow](https://github.com/Magniquick/DisablePROCHOT/actions/workflows/build.yml) | [Releases](https://github.com/Magniquick/DisablePROCHOT/releases)
 
-`DisablePROCHOT` is a small x86_64 UEFI application that clears the BD PROCHOT control bit at boot, then chains to the next UEFI boot entry.
+`DisablePROCHOT` is a tiny (~4.5 KB) x86_64 UEFI application that performs a **full thermal-throttle unlock** at boot, then chainloads the next UEFI boot entry.
 
-BD PROCHOT (Bi-Directional PROCHOT) can force very low CPU clocks (for example ~400 MHz) when platform firmware or sensors assert thermal throttling. This project is useful when BD PROCHOT is being triggered incorrectly.
+BD PROCHOT (Bi-Directional PROCHOT) can force very low CPU clocks (for example ~400 MHz) when platform firmware or sensors assert thermal throttling. On some platforms a phantom VR-thermal-alert clamp also pins the CPU and iGPU to base clock even when thermals are fine. This project is useful when either is being triggered incorrectly.
 
 ## Important Safety Warning
 
-Disabling BD PROCHOT removes a hardware thermal-throttling signal path. Use this only if you understand the risks and have verified your cooling and sensor health.
+This removes hardware thermal-throttling signal paths. Use this only if you understand the risks and have verified your cooling and sensor health.
 
 You are responsible for any hardware damage, instability, or data loss.
 
 ## Why This Exists
 
-Tools like ThrottleStop run after the OS starts. If BD PROCHOT is stuck, your entire boot sequence can remain slow.
+Tools like ThrottleStop run after the OS starts. If the throttle is stuck, your entire boot sequence can remain slow.
 
 This EFI app runs before OS boot, so the machine is not stuck at minimum clocks during startup.
 
-## What It Does
+## What It Does (full unlock)
 
-On real hardware:
-- Writes `0` to MSR `0x1FC` (`IA32_POWER_CTL`) to clear BD PROCHOT enable.
-- Attempts to chainload the next boot option from `BootOrder`.
+On real hardware it does a read-modify-write of MSR `0x1FC` (`IA32_POWER_CTL`), touching only the two bits it cares about and preserving every other firmware-set bit:
 
-In virtualized test environments:
-- Detects hypervisor presence and skips the MSR write.
-- Still exercises chainloading logic.
+- **bit 0 = 0**: clears BD PROCHOT enable (bi-directional processor-hot throttling).
+- **bit 24 = 1**: sets `DISABLE_VR_THERMAL_ALERT`, lifting the phantom VR-thermal clamp that otherwise pins CPU + iGPU to base clock.
+
+Together these are the "full unlock": both the PROCHOT path and the VR-thermal-alert path are released in one shot. The MSR never `#GP`s on real hardware (and QEMU/OVMF silently emulates it), so there is no hypervisor check or fault handler - it just does the write.
+
+It then chainloads the next loadable entry in `BootOrder`. Because firmware `Boot####` entries are stored in short form (`HD(signature)/File`, no hardware prefix) and many firmwares' `LoadImage` won't expand them, the app rebuilds a full device path from its own boot partition before loading - so the chainload works on real machines, not just in QEMU.
 
 ## Limitations
 
@@ -38,20 +39,21 @@ In virtualized test environments:
 
 ## Build
 
-Requirements (typical GNU-EFI setup):
-- `gcc`, `ld`, `objcopy`
-- GNU-EFI headers/libs (`/usr/include/efi`, `/usr/lib/libgnuefi.a`, `/usr/lib/libefi.a`)
+The application is compiled **natively to PE-COFF with clang + lld**: no GNU-EFI runtime, no `objcopy` ELF-to-PE conversion (UEFI binaries are just PE32+ with the MS x64 ABI, which `clang --target=x86_64-unknown-windows` emits directly). GNU-EFI's headers are used for type definitions only; all runtime helpers live in `DisablePROCHOT.c`.
 
-Build everything:
+Requirements:
+- `clang` and `lld`
+- GNU-EFI headers (`/usr/include/efi`) - headers only
+
+Build:
 
 ```bash
 ./build.sh
 ```
 
-This generates:
-- `DisablePROCHOT.efi`
-- `test/ChainSuccess.efi`
-- `test/SetBootOrder.efi`
+This generates `DisablePROCHOT.efi` (~4.5 KB). If a full GNU-EFI toolchain is also installed, `build.sh` additionally builds the QEMU test helpers (`test/*.efi`); otherwise it skips them.
+
+Prebuilt binaries are attached to each [release](https://github.com/Magniquick/DisablePROCHOT/releases).
 
 ## Installation / Bootloader Integration
 
@@ -78,6 +80,7 @@ Requirements:
 - `qemu-system-x86_64`
 - OVMF firmware (for Arch Linux, package `edk2-ovmf`)
 - `mtools` (`mcopy`, `mmd`) and `mkfs.vfat`
+- the GNU-EFI toolchain (for the test helpers)
 
 Run full test:
 
