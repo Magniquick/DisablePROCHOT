@@ -24,7 +24,13 @@ static EFI_GUID gEfiLoadedImageDevicePathProtocolGuid = {
 static EFI_GUID gEfiDevicePathProtocolGuid = {
     0x09576e91, 0x6d3f, 0x11d2, {0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b}};
 
-static void Output(CHAR16 *s) { ST->ConOut->OutputString(ST->ConOut, s); }
+static void Output(CHAR16 *s) {
+#ifdef SILENT
+  (void)s;  // no console output; LTO strips the now-unused string literals
+#else
+  ST->ConOut->OutputString(ST->ConOut, s);
+#endif
+}
 
 static INTN CompareMem(const void *a, const void *b, UINTN n) {
   const UINT8 *x = a, *y = b;

@@ -29,6 +29,26 @@ CLANG=(
 	-Wl,-subsystem:efi_application -Wl,-entry:efi_main -Wl,/opt:ref -Wl,/opt:icf
 )
 
+# --native-unsafe: the tight, this-machine build, for local use only. Smaller and
+# CPU-tuned but NOT for distribution; the default build is the safe one.
+#   -DSILENT            : drop all console strings (LTO strips them); smaller .rdata
+#   /merge:.rdata=.text : fold read-only data into .text (one fewer section)
+#   /align:32 /filealign:32 : 0x20 alignment packs tight, but loses W^X and some
+#                         firmwares may refuse to load it
+#   -mtune=native       : schedule for THIS CPU; not portable across microarches
+# Base -Os is kept (not -Oz; -Oz can rematerialize constants as runtime stores and
+# other size-over-all tricks, which is unpredictable and not worth it here).
+# -march=native is omitted (measured byte-identical; would only lock to this CPU).
+if [ "${1:-}" = "--native-unsafe" ]; then
+	# Minimal 64-byte MS-DOS stub (lld's default is 120 B). UEFI only reads
+	# e_lfanew at 0x3C to find the PE header; the DOS program is dead weight.
+	stub="$(mktemp)"; trap 'rm -f "$stub"' EXIT
+	{ printf 'MZ'; head -c 62 /dev/zero; } > "$stub"
+	CLANG+=( -DSILENT -mtune=native
+	         -Wl,/align:32 -Wl,/filealign:32 -Wl,/merge:.rdata=.text -Wl,/stub:"$stub" )
+	echo "** --native-unsafe: silent + 0x20 align + merge + min DOS stub + -mtune=native (this CPU)"
+fi
+
 build() { # <out.efi> <src.c>
 	"${CLANG[@]}" -o "$1" "$2"
 	echo "Built $1 ($(stat -c%s "$1") bytes)"
